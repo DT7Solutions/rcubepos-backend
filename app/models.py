@@ -2,8 +2,14 @@ from django.db import models
 
 # Create your models here.
 from django.db import models
+from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from simple_history.models import HistoricalRecords
+from datetime import date
+from django.utils.timezone import now
+from django.core.exceptions import ValidationError
+
+# ========================= # AUTH MODELS # =========================
 
 # User Manager
 class UserManager(BaseUserManager):
@@ -34,13 +40,11 @@ class UserManager(BaseUserManager):
         user.save(using=self._db)
         return user
 
-
 # Role Model
 class Role(models.Model):
     ROLE_CATEGORIES = [
         ("admin", "Admin"),
-        ("staff", "Staff"),
-        ("customer", "Customer"),
+        ("owner", "Owner"),
     ]
     
     role_name = models.CharField(max_length=100, unique=True)
@@ -54,9 +58,6 @@ class Role(models.Model):
 
     class Meta:
         db_table = 'role'
-
-
-
 
 #  User Model with Role
 class Users(AbstractBaseUser, PermissionsMixin):
@@ -97,6 +98,11 @@ class Users(AbstractBaseUser, PermissionsMixin):
     class Meta:
         db_table = 'users'
 
+        indexes = [
+            models.Index(fields=['email']),
+            models.Index(fields=['username']),
+            models.Index(fields=['phone']),
+        ]
 
 # User Role Assignment Model (Many-to-Many)
 class UserRole(models.Model):
@@ -113,4 +119,141 @@ class UserRole(models.Model):
     class Meta:
         db_table = 'user_role'
         unique_together = ("user", "role")
+
+User = settings.AUTH_USER_MODEL
+
+# ========================= # RESTAURANT MODELS # =========================
+
+class Restaurant(models.Model):
+    STATUS_CHOICES = [
+        ('Active', 'Active'),
+        ('Inactive', 'Inactive')
+    ]
+
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='restaurants')
+
+    name = models.CharField(max_length=100)
+    phone = models.CharField(max_length=15)
+    address = models.TextField()
+    gst_number = models.CharField(max_length=20, blank=True)
+
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='Active')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
+
+    is_deleted = models.BooleanField(default=False)
+
+    history = HistoricalRecords()
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        db_table = 'restaurants'
+        indexes = [
+            models.Index(fields=['owner']),
+            models.Index(fields=['status']),
+        ]
+
+# ========================= # SUBSCRIPTION MODELS # =========================
+
+class SubscriptionPlan(models.Model):
+    INTERVAL_CHOICES = [('monthly', 'Monthly'), ('yearly', 'Yearly')]
+
+    name = models.CharField(max_length=50)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    interval = models.CharField(max_length=10, choices=INTERVAL_CHOICES, default='monthly')
+    features = models.JSONField(default=list)
+    popular = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = HistoricalRecords()
+
+    def clean(self):
+        if self.price < 0:
+            raise ValidationError("Price cannot be negative.")
+        if self.interval not in dict(self.INTERVAL_CHOICES):
+            raise ValidationError("Invalid interval. Must be 'monthly' or 'yearly'.")
+
+    def __str__(self):
+        return f"{self.name} - ₹{self.price}/{self.interval}"
+    
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['name', 'interval'], name='unique_plan_per_interval')
+        ]
+        ordering = ['price']
+    
+class Subscription(models.Model):
+    STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('expired', 'Expired'),
+        ('none', 'None')
+    ]
+
+    def get_status(self):
+        if not self.plan:
+            return 'none'
+        if self.end_date and self.end_date < now().date():
+            return 'expired'
+        return 'active'
+
+    restaurant = models.OneToOneField(Restaurant, on_delete=models.CASCADE, related_name='subscription', null=True, blank=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='subscriptions')
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True)
+
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='none')
+
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+
+    history = HistoricalRecords()
+
+    class Meta:
+        db_table = 'subscriptions'
+        indexes = [
+            models.Index(fields=['restaurant']),
+            models.Index(fields=['status']),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=['user'], name='unique_user_subscription')
+        ]
+
+class Invoice(models.Model):
+    STATUS_CHOICES = [
+        ('paid', 'Paid'),
+        ('pending', 'Pending')
+    ]
+
+    subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='invoices')
+
+    date = models.DateField(auto_now_add=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    plan_name = models.CharField(max_length=50)
+
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+
+    history = HistoricalRecords()
+
+    class Meta:
+        db_table = 'invoices'
+
+# ========================= # PLATFORM SETTINGS # =========================
+
+class PlatformSettings(models.Model):
+    gst_percent = models.DecimalField(max_digits=5, decimal_places=2, default=5)
+    currency = models.CharField(max_length=5, default='INR')
+
+    history = HistoricalRecords()
+
+    class Meta:
+        verbose_name_plural = 'Platform Settings'
+        db_table = 'platform_settings'
+
+
+
 
