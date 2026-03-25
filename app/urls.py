@@ -1,4 +1,5 @@
 from django.urls import path, include
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework.routers import DefaultRouter
 
 from .views import *
@@ -9,7 +10,14 @@ router.register('plans', SubscriptionPlanViewSet, basename='plans')
 router.register('admin/users', AdminUserViewSet, basename='admin-users')
 
 urlpatterns = [
-    # AUTH
+    # AUTH ENDPOINTS
+    # Note: Public auth endpoints use JWT tokens for stateless authentication.
+    # CSRF protection is applied via middleware for session-based requests.
+    # API clients should:
+    # 1. Include Authorization header with JWT token for authenticated requests
+    # 2. For initial registration/login, CSRF token is not required (token is returned)
+    # 3. Refresh token is set as secure HTTPOnly cookie (auto-sent by browser)
+
     path('auth/login/', LoginView.as_view()),
     path('auth/register/', RegisterView.as_view()),
     path('auth/verify-otp/', VerifyOTPView.as_view()),

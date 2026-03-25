@@ -20,7 +20,11 @@ from django.urls import path,include
 from rest_framework import permissions
 from drf_yasg.views import get_schema_view
 from drf_yasg import openapi
-from django.conf.urls.static import static 
+from django.conf.urls.static import static
+
+# Restrict API documentation to admin users only in production
+# In development (DEBUG=True), allow all users
+api_doc_permission = [permissions.AllowAny if settings.DEBUG else permissions.IsAdminUser]
 
 schema_view = get_schema_view(
     openapi.Info(
@@ -28,8 +32,8 @@ schema_view = get_schema_view(
         default_version='v1',
         description="API Documentation",
     ),
-    public=True,
-    permission_classes=[permissions.AllowAny],
+    public=settings.DEBUG,  # Only public in development
+    permission_classes=api_doc_permission,
 )
 
 urlpatterns = [

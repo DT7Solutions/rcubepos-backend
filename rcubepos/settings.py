@@ -25,18 +25,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-dev-key-change-in-production')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = config('DEBUG', default=False, cast=bool)
 
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1').split(',')
 
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:8080",
-]
+CSRF_TRUSTED_ORIGINS = config(
+    'CSRF_TRUSTED_ORIGINS',
+    default='http://localhost:8080'
+).split(',')
 
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:8080",
-]
+CORS_ALLOWED_ORIGINS = config(
+    'CORS_ALLOWED_ORIGINS',
+    default='http://localhost:8080'
+).split(',')
 
 
 INSTALLED_APPS = [
@@ -176,7 +178,7 @@ SIMPLE_JWT = {
     'ROTATE_REFRESH_TOKENS': False,
     'BLACKLIST_AFTER_ROTATION': True,
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': SECRET_KEY,
+    'SIGNING_KEY': config('JWT_SIGNING_KEY', default=SECRET_KEY),
     'VERIFYING_KEY': None,
     'AUTH_HEADER_TYPES': ('Bearer',),
     'USER_ID_FIELD': 'id',
@@ -185,7 +187,7 @@ SIMPLE_JWT = {
 
 REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.AllowAny',
+        'rest_framework.permissions.IsAuthenticatedOrReadOnly',
     ],
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.SessionAuthentication',
@@ -197,12 +199,12 @@ REST_FRAMEWORK = {
 
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = config('EMAIL_HOST_USER')
-EMAIL_HOST_PASSWORD =config('EMAIL_HOST_PASSWORD')
-DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL')
+EMAIL_HOST = config('EMAIL_HOST', default='smtp.gmail.com')
+EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@example.com')
 
 
 # RAZORPAY_KEY_ID  = config('RAZORPAY_KEY_ID')
@@ -224,3 +226,39 @@ OTP_CONTEXT_CHANGE_EMAIL_NEW = 'change_email_new'
 # ==================== SUBSCRIPTION CONFIGURATION ====================
 SUBSCRIPTION_MONTHLY_DAYS = config('SUBSCRIPTION_MONTHLY_DAYS', default=30, cast=int)
 SUBSCRIPTION_YEARLY_DAYS = config('SUBSCRIPTION_YEARLY_DAYS', default=365, cast=int)
+
+# ==================== SECURITY HEADERS ====================
+# Only enforce in production (when DEBUG=False)
+if not DEBUG:
+    # Security headers
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
+    # HTTPS enforcement
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+    # XFrame options
+    X_FRAME_OPTIONS = 'DENY'
+
+    # Prevent MIME type sniffing
+    SECURE_CONTENT_SECURITY_POLICY = {
+        "default-src": ("'self'",),
+    }
+
+# ==================== SESSION & COOKIE CONFIGURATION ====================
+SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=False, cast=bool)
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Strict'
+SESSION_COOKIE_AGE = 86400  # 24 hours
+
+# Refresh token cookie settings
+COOKIE_DOMAIN = config('COOKIE_DOMAIN', default=None)
+REFRESH_TOKEN_COOKIE_SECURE = config('COOKIE_SECURE', default=False, cast=bool)
+REFRESH_TOKEN_COOKIE_HTTPONLY = True
+REFRESH_TOKEN_COOKIE_SAMESITE = 'Strict'
+
+# ==================== DATABASE PORT CONFIGURATION ====================
+DATABASES['default']['PORT'] = config('DB_PORT', default='5432')
