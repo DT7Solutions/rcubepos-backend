@@ -1,13 +1,11 @@
 from django.db import models
-
-# Create your models here.
-from django.db import models
 from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from simple_history.models import HistoricalRecords
 from datetime import date
 from django.utils.timezone import now
 from django.core.exceptions import ValidationError
+from django.db.models import Q
 
 # ========================= # AUTH MODELS # =========================
 
@@ -46,9 +44,13 @@ class Role(models.Model):
         ("admin", "Admin"),
         ("owner", "Owner"),
     ]
-    
+
     role_name = models.CharField(max_length=100, unique=True)
-    role_category = models.CharField(max_length=100, choices=ROLE_CATEGORIES, default="customer")
+    role_category = models.CharField(
+        max_length=100,
+        choices=ROLE_CATEGORIES,
+        default="owner"  # Must be a valid choice from ROLE_CATEGORIES
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     history = HistoricalRecords()
@@ -63,36 +65,53 @@ class Role(models.Model):
 class Users(AbstractBaseUser, PermissionsMixin):
     first_name = models.CharField(max_length=100, blank=True, null=True)
     last_name = models.CharField(max_length=100, blank=True, null=True)
-    phone = models.CharField(max_length=20, blank=True, null=True, unique=True)
-    email = models.EmailField(max_length=100, blank=True, null=True, unique=True)
+    phone = models.CharField(
+        max_length=20,
+        blank=True,
+        null=True,
+        # NOTE: unique=True allows multiple NULLs. Use database constraint or validation.
+        unique=True
+    )
+    email = models.EmailField(
+        max_length=100,
+        # USERNAME_FIELD must NOT be nullable - required for authentication
+        blank=False,
+        null=False,
+        unique=True
+    )
     username = models.CharField(max_length=100, unique=True, blank=False, null=False)
     profile_image = models.ImageField(upload_to='profile_img/', blank=True, null=True)
     firebase_id = models.TextField(blank=True, null=True, default=None)
     date_of_birth = models.DateField(blank=True, null=True, default=None)
-    
+
     address = models.TextField(blank=True, null=True, default=None)
-    city = models.CharField(blank=True, null=True, default=None)
-    district = models.CharField(blank=True, null=True, default=None)
-    state = models.CharField(blank=True, null=True, default=None)
-    pincode = models.IntegerField(blank=True, null=True, default=None)
-   
-    otp = models.CharField(max_length=6, blank=True, null=True,default=None)
+    city = models.CharField(max_length=100, blank=True, null=True, default=None)
+    district = models.CharField(max_length=100, blank=True, null=True, default=None)
+    state = models.CharField(max_length=100, blank=True, null=True, default=None)
+    pincode = models.CharField(
+        max_length=10,  # Changed from IntegerField to handle postal codes with letters
+        blank=True,
+        null=True,
+        default=None
+    )
+
+    otp = models.CharField(max_length=6, blank=True, null=True, default=None)
     otp_created_at = models.DateTimeField(blank=True, null=True, default=None)
     otp_attempts = models.IntegerField(default=0)
     otp_blocked_until = models.DateTimeField(blank=True, null=True, default=None)
     otp_last_sent_at = models.DateTimeField(blank=True, null=True, default=None)
 
-    otp_context = models.CharField(max_length=50, blank=True, null=True, default=None)  # e.g., "login", "password_reset"
-    pending_email = models.EmailField(max_length=100, blank=True, null=True, default=None)  # For email change verification
-    
+    otp_context = models.CharField(max_length=50, blank=True, null=True, default=None)
+    pending_email = models.EmailField(max_length=100, blank=True, null=True, default=None)
+
     is_email_verified = models.BooleanField(default=False)
 
     role = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True, blank=True, related_name="users")
-    
+
     is_active = models.BooleanField(default=True)
     is_superuser = models.BooleanField(default=False)
     is_staff = models.BooleanField(default=False)
-    
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -101,6 +120,24 @@ class Users(AbstractBaseUser, PermissionsMixin):
 
     objects = UserManager()
     history = HistoricalRecords()
+
+    def clean(self):
+        """Validate model constraints that can't be enforced at database level."""
+        from django.core.validators import validate_email
+
+        # Validate email format
+        if self.email:
+            try:
+                validate_email(self.email)
+            except ValidationError:
+                raise ValidationError({'email': 'Invalid email format'})
+
+        # Validate OTP format if present
+        if self.otp and not self.otp.isdigit():
+            raise ValidationError({'otp': 'OTP must contain only digits'})
+
+        if self.otp and len(self.otp) != 6:
+            raise ValidationError({'otp': 'OTP must be 6 digits'})
 
     def __str__(self):
         return self.username
@@ -184,10 +221,31 @@ class SubscriptionPlan(models.Model):
     history = HistoricalRecords()
 
     def clean(self):
-        if self.price < 0:
-            raise ValidationError("Price cannot be negative.")
+        """Validate plan constraints."""
+        # Price validation
+        if self.price and self.price < 0:
+            raise ValidationError({'price': 'Price cannot be negative.'})
+
+        if self.price and self.price > 999999.99:
+            raise ValidationError({'price': 'Price exceeds maximum limit.'})
+
+        # Interval validation
         if self.interval not in dict(self.INTERVAL_CHOICES):
-            raise ValidationError("Invalid interval. Must be 'monthly' or 'yearly'.")
+            raise ValidationError({'interval': "Invalid interval. Must be 'monthly' or 'yearly'."})
+
+        # Features validation
+        if not isinstance(self.features, list):
+            raise ValidationError({'features': 'Features must be a list.'})
+
+        if len(self.features) > 50:
+            raise ValidationError({'features': 'Maximum 50 features allowed.'})
+
+        for feature in self.features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise ValidationError({'features': 'Each feature must be a non-empty string.'})
+
+            if len(feature) > 255:
+                raise ValidationError({'features': 'Feature names must be under 255 characters.'})
 
     def __str__(self):
         return f"{self.name} - ₹{self.price}/{self.interval}"

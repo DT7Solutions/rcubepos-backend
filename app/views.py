@@ -513,6 +513,9 @@ class ResendOTPView(APIView):
         except Exception as e:
             logger = logging.getLogger(__name__)
             logger.error(f"Unexpected error in resend OTP for {email}: {str(e)}", exc_info=True)
+            return Response(
+                {
+                    "success": False,
                     "error": "Something went wrong"
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -525,18 +528,34 @@ class CheckAvailabilityView(APIView):
         field = request.data.get("field")
         value = request.data.get("value")
 
-        if field not in ["email", "username", "phone"]:
+        # Validate field name - only allow safe field names
+        allowed_fields = ["email", "username", "phone"]
+        if field not in allowed_fields:
             return Response(
                 {"error": "Invalid field"},
-                status=400
+                status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Validate value is provided and has reasonable length
+        if not value:
+            return Response(
+                {"error": f"{field} is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if len(str(value)) > 255:
+            return Response(
+                {"error": f"{field} is too long"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Safe to use field name since we validated it above
         exists = Users.objects.filter(**{field: value}).exists()
 
         return Response({
             "field": field,
             "available": not exists
-        })
+        }, status=status.HTTP_200_OK)
 
 class RefreshTokenView(APIView):
     authentication_classes = []

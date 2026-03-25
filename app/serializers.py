@@ -1,5 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import *
 
 # ========================= # ROLE SERIALIZER # =========================
@@ -27,7 +29,7 @@ class UserSerializer(serializers.ModelSerializer):
 
 # ========================= # AUTH SERIALIZER # =========================
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, min_length=8)
 
     class Meta:
         model = Users
@@ -39,6 +41,14 @@ class RegisterSerializer(serializers.ModelSerializer):
             'phone',
             'password',
         ]
+
+    def validate_password(self, value):
+        """Validate password strength using Django's built-in validators."""
+        try:
+            validate_password(value)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(e.messages)
+        return value
 
     def validate_username(self, value):
         if Users.objects.filter(username=value).exists():
@@ -73,7 +83,7 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 class LoginSerializer(serializers.Serializer):
     email = serializers.EmailField()
-    password = serializers.CharField()
+    password = serializers.CharField(min_length=8)
 
     def validate(self, data):
         user = authenticate(
@@ -86,15 +96,35 @@ class LoginSerializer(serializers.Serializer):
 
         data['user'] = user
         return data
-    
+
 class ProfileUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Users
         fields = ['first_name', 'last_name', 'email', 'phone']
 
+    def validate_email(self, value):
+        """Check that email is not already used by another user."""
+        if Users.objects.filter(email=value).exclude(pk=self.instance.pk).exists():
+            raise serializers.ValidationError("Email already in use")
+        return value
+
+    def validate_phone(self, value):
+        """Check that phone is not already used by another user."""
+        if value and Users.objects.filter(phone=value).exclude(pk=self.instance.pk).exists():
+            raise serializers.ValidationError("Phone number already in use")
+        return value
+
 class ChangePasswordSerializer(serializers.Serializer):
     current = serializers.CharField()
-    new_password = serializers.CharField()
+    new_password = serializers.CharField(min_length=8)
+
+    def validate_new_password(self, value):
+        """Validate new password strength."""
+        try:
+            validate_password(value)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(e.messages)
+        return value
 
     def validate(self, data):
         user = self.context['request'].user
@@ -194,6 +224,12 @@ class OwnerSubscriptionSerializer(serializers.ModelSerializer):
 class ChangePlanSerializer(serializers.Serializer):
     plan_id = serializers.IntegerField()
 
+    def validate_plan_id(self, value):
+        """Validate that the plan exists."""
+        if not SubscriptionPlan.objects.filter(id=value).exists():
+            raise serializers.ValidationError("Subscription plan does not exist.")
+        return value
+
 class SubscriptionPlanSerializer(serializers.ModelSerializer):
     class Meta:
         model = SubscriptionPlan
@@ -213,6 +249,8 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
     def validate_price(self, value):
         if value < 0:
             raise serializers.ValidationError("Price cannot be negative.")
+        if value > 999999.99:
+            raise serializers.ValidationError("Price exceeds maximum limit.")
         return value
 
     def validate_interval(self, value):
@@ -223,10 +261,16 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
     def validate_features(self, value):
         if not isinstance(value, list):
             raise serializers.ValidationError("Features must be a list.")
-        
+
+        if len(value) > 50:
+            raise serializers.ValidationError("Maximum 50 features allowed.")
+
         if not all(isinstance(feature, str) and feature.strip() for feature in value):
             raise serializers.ValidationError("Each feature must be a non-empty string.")
-        
+
+        if any(len(feature) > 255 for feature in value):
+            raise serializers.ValidationError("Feature names must be under 255 characters.")
+
         return value
     def validate(self, data):
         name = data.get("name", getattr(self.instance, "name", None))
