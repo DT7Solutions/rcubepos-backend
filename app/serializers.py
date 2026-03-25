@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from django.contrib.auth import authenticate
+from django.contrib.auth import authenticate, get_user_model
 from .models import *
 
 # ========================= # ROLE SERIALIZER # =========================
@@ -39,6 +39,21 @@ class RegisterSerializer(serializers.ModelSerializer):
             'phone',
             'password',
         ]
+
+    def validate_username(self, value):
+        if Users.objects.filter(username=value).exists():
+            raise serializers.ValidationError("Username already exists")
+        return value
+
+    def validate_email(self, value):
+        if Users.objects.filter(email=value).exists():
+            raise serializers.ValidationError("Email already exists")
+        return value
+
+    def validate_phone(self, value):
+        if Users.objects.filter(phone=value).exists():
+            raise serializers.ValidationError("Phone number already exists")
+        return value
 
     def create(self, validated_data):
         password = validated_data.pop('password')
@@ -99,6 +114,7 @@ class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
 # ======================== # ADMIN USER SERIALIZER # =========================
+User = get_user_model()
 class AdminUserSerializer(serializers.ModelSerializer):
     restaurant_name = serializers.SerializerMethodField()
 
@@ -110,7 +126,7 @@ class AdminUserSerializer(serializers.ModelSerializer):
             "email",
             "phone",
             "restaurant_name",
-            "date_joined",
+            "created_at",
             "is_active",
         ]
 

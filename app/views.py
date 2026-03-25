@@ -12,73 +12,565 @@ from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from drf_yasg.utils import swagger_auto_schema
 
 from django.utils.timezone import now
+from django.db import transaction
 from datetime import timedelta
+import logging
 
 from .models import *
 from .serializers import *
+from .utils import *
 
 # Create your views here.
 
 # ========================= # AUTH VIEWS # =========================
-def get_tokens_for_user(user):
-
-    refresh = RefreshToken.for_user(user)
-    return {
-        'access_token': str(refresh.access_token),  # matches frontend
-        'refresh_token': str(refresh),
-    }
 
 class RegisterView(APIView):
     permission_classes = [permissions.AllowAny]
 
     @swagger_auto_schema(request_body=RegisterSerializer)
     def post(self, request):
-        serializer = RegisterSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        """
+        Register a new user with improved error handling.
+        
+        Handles:
+        - Missing or invalid fields
+        - Duplicate email/username
+        - Database errors
+        - Token generation errors
+        """
+        try:
+            serializer = RegisterSerializer(data=request.data)
+            
+            if not serializer.is_valid():
+                return Response(
+                    {
+                        "success": False,
+                        "error": "Validation failed",
+                        "details": serializer.errors
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-        user = serializer.save()
-        token_data = get_tokens_for_user(user)
+            user = serializer.save()
+            current_time = now()
 
-        response = Response({
-            "access_token": token_data["access_token"],
-            "user": UserSerializer(user).data
-        }, status=status.HTTP_201_CREATED)
+            # Generate OTP
+            otp_code = generate_otp()
 
-        response.set_cookie(
-            key='refresh_token',
-            value=token_data["refresh_token"],
-            httponly=True,
-            secure=True,
-            samesite='None',
-        )
+            # Set Full OTP State
+            user.otp = otp_code
+            user.otp_created_at = current_time
+            user.otp_last_sent_at = current_time
+            user.is_email_verified = False
+            user.otp_context = "register"
+            user.otp_attempts = 0
+            user.otp_blocked_until = None
+            user.save()
 
-        return response
-    
+            # Send OTP email
+            try:
+                send_otp_email(user.email, otp_code, context="register")
+
+            except Exception as e:
+                return Response(
+                    {
+                        "success": False,
+                        "error": "User created but failed to send OTP email",
+                        "details": {"email": ["Failed to send OTP email"]},
+                        # "user_id": user.id,
+                        # "email": user.email
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            return Response(
+                {
+                    "success": True,
+                    "message": "User registered successfully. Please verify your email with the OTP sent.",
+                    "user_id": user.id,
+                    "email": user.email,
+                    "action": "VERIFY_OTP"
+                },
+                status=status.HTTP_201_CREATED
+            )
+
+        except ValidationError as e:
+            return Response(
+                {
+                    "success": False,
+                    "error": "Validation error",
+                    "details": e.detail if hasattr(e, 'detail') else {}
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            # Catch unexpected errors
+            return Response(
+                {
+                    "success": False,
+                    "error": "An unexpected error occurred during registration",
+                    "details": {e.__class__.__name__: str(e)}
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     @swagger_auto_schema(request_body=LoginSerializer)
     def post(self, request):
-        serializer = LoginSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer = LoginSerializer(data=request.data)
 
-        user = serializer.validated_data['user']
-        token_data = get_tokens_for_user(user)
+            if not serializer.is_valid():
+                return Response(
+                    {
+                        "error": "Invalid credentials",
+                        "details": serializer.errors
+                    },
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
 
-        response = Response({
-            "access_token": token_data["access_token"],
-            "user": UserSerializer(user).data
+            user = serializer.validated_data.get('user')
+
+            if not user:
+                return Response(
+                    {
+                        "error": "Invalid email or password",
+                        "details": {}
+                    },
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
+
+            # Account inactive
+            if not user.is_active:
+                return Response(
+                    {
+                        "error": "Account is deactivated",
+                        "details": {"account": ["Your account has been disabled"]}
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            current_time = now()
+
+            # EMAIL NOT VERIFIED → TRIGGER OTP FLOW
+            if not user.is_email_verified:
+
+                with transaction.atomic():
+                    user = Users.objects.select_for_update().get(id=user.id)
+
+                    # Block check (OTP only)
+                    if user.otp_blocked_until and current_time < user.otp_blocked_until:
+                        return Response(
+                            {
+                                "success": False,
+                                "error": "Too many failed OTP attempts. Try again later.",
+                                "blocked_until": user.otp_blocked_until,
+                                "code": "OTP_BLOCKED"
+                            },
+                            status=status.HTTP_403_FORBIDDEN
+                        )
+
+                    # Cooldown check (60 sec)
+                    if user.otp_last_sent_at and current_time < user.otp_last_sent_at + timedelta(seconds=60):
+                        remaining = int(
+                            (user.otp_last_sent_at + timedelta(seconds=60) - current_time).total_seconds()
+                        )
+                        return Response(
+                            {
+                                "success": False,
+                                "error": f"Please wait {remaining} seconds before requesting OTP.",
+                                "code": "OTP_COOLDOWN"
+                            },
+                            status=status.HTTP_429_TOO_MANY_REQUESTS
+                        )
+
+                    # Generate OTP
+                    otp_code = generate_otp()
+
+                    user.otp = otp_code
+                    user.otp_created_at = current_time
+                    user.otp_last_sent_at = current_time
+                    user.otp_context = "register"  # reuse register flow
+
+                    user.save()
+
+                # Send OTP (outside transaction)
+                try:
+                    send_otp_email(user.email, otp_code, context="register")
+                except Exception as e:
+                    logger = logging.getLogger(__name__)
+                    logger.error(f"Failed to send OTP email to {user.email}: {str(e)}", exc_info=True)
+                    return Response(
+                        {
+                            "success": False,
+                            "error": "Failed to send OTP email",
+                            "details": {"email": ["Failed to send OTP email"]}
+                        },
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
+
+                return Response(
+                    {
+                        "success": False,
+                        "error": "Email not verified",
+                        "message": "OTP sent to your email. Please verify to continue.",
+                        "email": user.email,
+                        "code": "EMAIL_NOT_VERIFIED",
+                        "action": "VERIFY_OTP"
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+            # VERIFIED USER → NORMAL LOGIN
+
+            try:
+                token_data = get_tokens_for_user(user)
+            except Exception:
+                return Response(
+                    {
+                        "error": "Failed to generate authentication tokens",
+                        "details": {}
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+            if not token_data.get("access_token"):
+                return Response(
+                    {
+                        "error": "Authentication token generation failed",
+                        "details": {}
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+            response = Response(
+                {
+                    "success": True,
+                    "message": "Login successful",
+                    "access_token": token_data["access_token"],
+                    "user": UserSerializer(user).data
+                },
+                status=status.HTTP_200_OK
+            )
+
+            response.set_cookie(
+                key='refresh_token',
+                value=token_data["refresh_token"],
+                httponly=True,
+                secure=True,
+                samesite='None',
+            )
+
+            return response
+
+        except ValidationError as e:
+            return Response(
+                {
+                    "error": "Validation error",
+                    "details": e.detail if hasattr(e, 'detail') else {}
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        except Exception as e:
+            return Response(
+                {
+                    "success": False,
+                    "error": "An unexpected error occurred during login",
+                    "details": str(e)
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+class VerifyOTPView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get("email")
+        otp = request.data.get("otp")
+
+        if not email or not otp:
+            return Response({
+                "success": False,
+                "error": "Email and OTP are required"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = Users.objects.get(email=email)
+        except Users.DoesNotExist:
+            return Response({
+                "success": False,
+                "error": "User not found"
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        current_time = now()
+
+        # BLOCK CHECK
+        if user.otp_blocked_until and current_time < user.otp_blocked_until:
+            return Response({
+                "success": False,
+                "error": "Too many failed OTP attempts. Try again later.",
+                "blocked_until": user.otp_blocked_until,
+                "code": "OTP_BLOCKED"
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # EXPIRY CHECK
+        if not user.otp_created_at or current_time > user.otp_created_at + timedelta(minutes=10):
+            return Response({
+                "success": False,
+                "error": "OTP expired. Please request a new one.",
+                "code": "OTP_EXPIRED"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # INVALID OTP
+        if user.otp != otp:
+            user.otp_attempts += 1
+
+            if user.otp_attempts >= 5:
+                user.otp_blocked_until = current_time + timedelta(hours=6)
+
+            user.save()
+
+            return Response({
+                "success": False,
+                "error": "Invalid OTP",
+                "attempts_remaining": max(0, 5 - user.otp_attempts)
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # CONTEXT CHECK (ONLY ON SUCCESS)
+        context = user.otp_context
+
+        if not context:
+            return Response({
+                "success": False,
+                "error": "OTP context missing. Please request OTP again.",
+                "code": "OTP_CONTEXT_MISSING"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # =============================
+        # CONTEXT HANDLING
+        # =============================
+
+        if context == "register":
+            user.is_email_verified = True
+
+            try:
+                token_data = get_tokens_for_user(user)
+            except Exception:
+                return Response({
+                    "success": False,
+                    "error": "Verification successful but login failed"
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            # RESET STATE
+            user.otp = None
+            user.otp_attempts = 0
+            user.otp_blocked_until = None
+            user.otp_created_at = None
+            user.otp_context = None
+            user.save()
+
+            response = Response({
+                "success": True,
+                "message": "Email verified successfully",
+                "access_token": token_data["access_token"],
+                "user": {
+                    "id": user.id,
+                    "email": user.email,
+                    "username": user.username
+                }
+            }, status=status.HTTP_200_OK)
+
+            response.set_cookie(
+                key='refresh_token',
+                value=token_data["refresh_token"],
+                httponly=True,
+                secure=True,
+                samesite='None',
+            )
+
+            return response
+
+        elif context == "change_password":
+            # reset only OTP
+            user.otp = None
+            user.otp_created_at = None
+            user.otp_context = None
+            user.save()
+
+            return Response({
+                "success": True,
+                "message": "OTP verified. You can now reset your password."
+            }, status=status.HTTP_200_OK)
+
+        elif context == "change_email_old":
+            user.otp = None
+            user.otp_created_at = None
+            user.otp_context = None
+            user.save()
+
+            return Response({
+                "success": True,
+                "message": "Current email verified. Proceed to verify new email."
+            }, status=status.HTTP_200_OK)
+
+        elif context == "change_email_new":
+            if not user.pending_email:
+                return Response({
+                    "success": False,
+                    "error": "No pending email found"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            user.email = user.pending_email
+            user.pending_email = None
+
+            user.otp = None
+            user.otp_created_at = None
+            user.otp_context = None
+            user.save()
+
+            return Response({
+                "success": True,
+                "message": "Email updated successfully",
+                "email": user.email
+            }, status=status.HTTP_200_OK)
+
+        # UNKNOWN CONTEXT
+        return Response({
+            "success": False,
+            "error": "Invalid OTP context",
+            "code": "INVALID_CONTEXT"
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+class ResendOTPView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get("email")
+
+        if not email:
+            return Response(
+                {
+                    "success": False,
+                    "error": "Email is required"
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            with transaction.atomic():
+                user = Users.objects.select_for_update().get(email=email)
+
+                current_time = now()
+
+                # BLOCK CHECK (OTP-specific)
+                if user.otp_blocked_until and current_time < user.otp_blocked_until:
+                    return Response(
+                        {
+                            "success": False,
+                            "error": "Too many failed attempts. Try again later.",
+                            "blocked_until": user.otp_blocked_until,
+                            "code": "OTP_BLOCKED"
+                        },
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                # COOLDOWN CHECK (60 seconds)
+                if user.otp_last_sent_at and current_time < user.otp_last_sent_at + timedelta(seconds=60):
+                    remaining = int(
+                        (user.otp_last_sent_at + timedelta(seconds=60) - current_time).total_seconds()
+                    )
+                    return Response(
+                        {
+                            "success": False,
+                            "error": f"Please wait {remaining} seconds before requesting another OTP.",
+                            "code": "OTP_COOLDOWN"
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS
+                    )
+
+                # CONTEXT CHECK
+                if not user.otp_context:
+                    return Response(
+                        {
+                            "success": False,
+                            "error": "No active OTP request found"
+                        },
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # GENERATE NEW OTP
+                new_otp = generate_otp()
+
+                user.otp = new_otp
+                user.otp_created_at = current_time
+                user.otp_last_sent_at = current_time
+                # ❗ DO NOT reset otp_attempts (prevents brute force bypass)
+
+                user.save()
+
+            # SEND EMAIL (outside transaction)
+            try:
+                send_otp_email(user.email, new_otp, context=user.otp_context)
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to send OTP email to {user.email}: {str(e)}", exc_info=True)
+                return Response(
+                    {
+                        "success": False,
+                        "error": "Failed to send OTP email",
+                        "details": {"email": [str(e)]}
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+            return Response(
+                {
+                    "success": True,
+                    "message": "OTP resent successfully",
+                    "email": user.email
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except Users.DoesNotExist:
+            return Response(
+                {
+                    "success": False,
+                    "error": "User not found"
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        except Exception:
+            return Response(
+                {
+                    "success": False,
+                    "error": "Something went wrong"
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class CheckAvailabilityView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        field = request.data.get("field")
+        value = request.data.get("value")
+
+        if field not in ["email", "username", "phone"]:
+            return Response(
+                {"error": "Invalid field"},
+                status=400
+            )
+
+        exists = Users.objects.filter(**{field: value}).exists()
+
+        return Response({
+            "field": field,
+            "available": not exists
         })
-
-        response.set_cookie(
-            key='refresh_token',
-            value=token_data["refresh_token"],
-            httponly=True,
-            secure=True,
-            samesite='None',
-        )
-
-        return response
 
 class RefreshTokenView(APIView):
     authentication_classes = []
@@ -347,8 +839,7 @@ class MySubscriptionView(APIView):
         })
 
 class SubscriptionPlanViewSet(viewsets.ModelViewSet):
-    authentication_classes = [JWTAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     serializer_class = SubscriptionPlanSerializer
 
     def get_queryset(self):

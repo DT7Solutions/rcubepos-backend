@@ -76,7 +76,17 @@ class Users(AbstractBaseUser, PermissionsMixin):
     state = models.CharField(blank=True, null=True, default=None)
     pincode = models.IntegerField(blank=True, null=True, default=None)
    
-    otp = models.IntegerField(blank=True, null=True,default=None)
+    otp = models.CharField(max_length=6, blank=True, null=True,default=None)
+    otp_created_at = models.DateTimeField(blank=True, null=True, default=None)
+    otp_attempts = models.IntegerField(default=0)
+    otp_blocked_until = models.DateTimeField(blank=True, null=True, default=None)
+    otp_last_sent_at = models.DateTimeField(blank=True, null=True, default=None)
+
+    otp_context = models.CharField(max_length=50, blank=True, null=True, default=None)  # e.g., "login", "password_reset"
+    pending_email = models.EmailField(max_length=100, blank=True, null=True, default=None)  # For email change verification
+    
+    is_email_verified = models.BooleanField(default=False)
+
     role = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True, blank=True, related_name="users")
     
     is_active = models.BooleanField(default=True)
