@@ -6,6 +6,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from django.contrib.auth import authenticate
+from django.conf import settings
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
@@ -62,23 +63,23 @@ class RegisterView(APIView):
             user.otp_created_at = current_time
             user.otp_last_sent_at = current_time
             user.is_email_verified = False
-            user.otp_context = "register"
+            user.otp_context = settings.OTP_CONTEXT_REGISTER
             user.otp_attempts = 0
             user.otp_blocked_until = None
             user.save()
 
             # Send OTP email
             try:
-                send_otp_email(user.email, otp_code, context="register")
+                send_otp_email(user.email, otp_code, context=settings.OTP_CONTEXT_REGISTER)
 
             except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to send OTP email to {user.email}: {str(e)}", exc_info=True)
                 return Response(
                     {
                         "success": False,
                         "error": "User created but failed to send OTP email",
                         "details": {"email": ["Failed to send OTP email"]},
-                        # "user_id": user.id,
-                        # "email": user.email
                     },
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
@@ -104,11 +105,13 @@ class RegisterView(APIView):
             )
         except Exception as e:
             # Catch unexpected errors
+            logger = logging.getLogger(__name__)
+            logger.error(f"Unexpected error during registration: {str(e)}", exc_info=True)
             return Response(
                 {
                     "success": False,
                     "error": "An unexpected error occurred during registration",
-                    "details": {e.__class__.__name__: str(e)}
+                    "details": {}
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
@@ -159,31 +162,15 @@ class LoginView(APIView):
                 with transaction.atomic():
                     user = Users.objects.select_for_update().get(id=user.id)
 
-                    # Block check (OTP only)
-                    if user.otp_blocked_until and current_time < user.otp_blocked_until:
-                        return Response(
-                            {
-                                "success": False,
-                                "error": "Too many failed OTP attempts. Try again later.",
-                                "blocked_until": user.otp_blocked_until,
-                                "code": "OTP_BLOCKED"
-                            },
-                            status=status.HTTP_403_FORBIDDEN
-                        )
+                    # Block check
+                    block_response = check_otp_blocked(user, current_time)
+                    if block_response:
+                        return block_response
 
-                    # Cooldown check (60 sec)
-                    if user.otp_last_sent_at and current_time < user.otp_last_sent_at + timedelta(seconds=60):
-                        remaining = int(
-                            (user.otp_last_sent_at + timedelta(seconds=60) - current_time).total_seconds()
-                        )
-                        return Response(
-                            {
-                                "success": False,
-                                "error": f"Please wait {remaining} seconds before requesting OTP.",
-                                "code": "OTP_COOLDOWN"
-                            },
-                            status=status.HTTP_429_TOO_MANY_REQUESTS
-                        )
+                    # Cooldown check
+                    cooldown_response = check_otp_cooldown(user, current_time)
+                    if cooldown_response:
+                        return cooldown_response
 
                     # Generate OTP
                     otp_code = generate_otp()
@@ -191,13 +178,13 @@ class LoginView(APIView):
                     user.otp = otp_code
                     user.otp_created_at = current_time
                     user.otp_last_sent_at = current_time
-                    user.otp_context = "register"  # reuse register flow
+                    user.otp_context = settings.OTP_CONTEXT_REGISTER
 
                     user.save()
 
                 # Send OTP (outside transaction)
                 try:
-                    send_otp_email(user.email, otp_code, context="register")
+                    send_otp_email(user.email, otp_code, context=settings.OTP_CONTEXT_REGISTER)
                 except Exception as e:
                     logger = logging.getLogger(__name__)
                     logger.error(f"Failed to send OTP email to {user.email}: {str(e)}", exc_info=True)
@@ -226,7 +213,9 @@ class LoginView(APIView):
 
             try:
                 token_data = get_tokens_for_user(user)
-            except Exception:
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Token generation failed for user {user.id}: {str(e)}", exc_info=True)
                 return Response(
                     {
                         "error": "Failed to generate authentication tokens",
@@ -296,6 +285,13 @@ class VerifyOTPView(APIView):
                 "error": "Email and OTP are required"
             }, status=status.HTTP_400_BAD_REQUEST)
 
+        # Validate OTP format (should be numeric and correct length)
+        if not otp.isdigit() or len(otp) != settings.OTP_LENGTH:
+            return Response({
+                "success": False,
+                "error": f"OTP must be {settings.OTP_LENGTH} digits"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             user = Users.objects.get(email=email)
         except Users.DoesNotExist:
@@ -307,35 +303,31 @@ class VerifyOTPView(APIView):
         current_time = now()
 
         # BLOCK CHECK
-        if user.otp_blocked_until and current_time < user.otp_blocked_until:
-            return Response({
-                "success": False,
-                "error": "Too many failed OTP attempts. Try again later.",
-                "blocked_until": user.otp_blocked_until,
-                "code": "OTP_BLOCKED"
-            }, status=status.HTTP_403_FORBIDDEN)
+        block_response = check_otp_blocked(user, current_time)
+        if block_response:
+            return block_response
 
         # EXPIRY CHECK
-        if not user.otp_created_at or current_time > user.otp_created_at + timedelta(minutes=10):
-            return Response({
-                "success": False,
-                "error": "OTP expired. Please request a new one.",
-                "code": "OTP_EXPIRED"
-            }, status=status.HTTP_400_BAD_REQUEST)
+        expiry_response = check_otp_expired(user, current_time)
+        if expiry_response:
+            return expiry_response
 
-        # INVALID OTP
+        # INVALID OTP - Atomic update to prevent race conditions
         if user.otp != otp:
-            user.otp_attempts += 1
+            with transaction.atomic():
+                # Re-fetch with lock to prevent concurrent modifications
+                user = Users.objects.select_for_update().get(id=user.id)
 
-            if user.otp_attempts >= 5:
-                user.otp_blocked_until = current_time + timedelta(hours=6)
+                user.otp_attempts += 1
+                if user.otp_attempts >= settings.OTP_MAX_ATTEMPTS:
+                    user.otp_blocked_until = current_time + timedelta(hours=settings.OTP_BLOCK_DURATION_HOURS)
 
-            user.save()
+                user.save()
 
             return Response({
                 "success": False,
                 "error": "Invalid OTP",
-                "attempts_remaining": max(0, 5 - user.otp_attempts)
+                "attempts_remaining": max(0, settings.OTP_MAX_ATTEMPTS - user.otp_attempts)
             }, status=status.HTTP_400_BAD_REQUEST)
 
         # CONTEXT CHECK (ONLY ON SUCCESS)
@@ -352,23 +344,21 @@ class VerifyOTPView(APIView):
         # CONTEXT HANDLING
         # =============================
 
-        if context == "register":
+        if context == settings.OTP_CONTEXT_REGISTER:
             user.is_email_verified = True
 
             try:
                 token_data = get_tokens_for_user(user)
-            except Exception:
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Token generation failed for user {user.id}: {str(e)}", exc_info=True)
                 return Response({
                     "success": False,
                     "error": "Verification successful but login failed"
                 }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
             # RESET STATE
-            user.otp = None
-            user.otp_attempts = 0
-            user.otp_blocked_until = None
-            user.otp_created_at = None
-            user.otp_context = None
+            reset_otp_fields(user, full_reset=True)
             user.save()
 
             response = Response({
@@ -392,11 +382,8 @@ class VerifyOTPView(APIView):
 
             return response
 
-        elif context == "change_password":
-            # reset only OTP
-            user.otp = None
-            user.otp_created_at = None
-            user.otp_context = None
+        elif context == settings.OTP_CONTEXT_CHANGE_PASSWORD:
+            reset_otp_fields(user, full_reset=False)
             user.save()
 
             return Response({
@@ -404,10 +391,8 @@ class VerifyOTPView(APIView):
                 "message": "OTP verified. You can now reset your password."
             }, status=status.HTTP_200_OK)
 
-        elif context == "change_email_old":
-            user.otp = None
-            user.otp_created_at = None
-            user.otp_context = None
+        elif context == settings.OTP_CONTEXT_CHANGE_EMAIL_OLD:
+            reset_otp_fields(user, full_reset=False)
             user.save()
 
             return Response({
@@ -415,7 +400,7 @@ class VerifyOTPView(APIView):
                 "message": "Current email verified. Proceed to verify new email."
             }, status=status.HTTP_200_OK)
 
-        elif context == "change_email_new":
+        elif context == settings.OTP_CONTEXT_CHANGE_EMAIL_NEW:
             if not user.pending_email:
                 return Response({
                     "success": False,
@@ -425,9 +410,7 @@ class VerifyOTPView(APIView):
             user.email = user.pending_email
             user.pending_email = None
 
-            user.otp = None
-            user.otp_created_at = None
-            user.otp_context = None
+            reset_otp_fields(user, full_reset=False)
             user.save()
 
             return Response({
@@ -464,31 +447,15 @@ class ResendOTPView(APIView):
 
                 current_time = now()
 
-                # BLOCK CHECK (OTP-specific)
-                if user.otp_blocked_until and current_time < user.otp_blocked_until:
-                    return Response(
-                        {
-                            "success": False,
-                            "error": "Too many failed attempts. Try again later.",
-                            "blocked_until": user.otp_blocked_until,
-                            "code": "OTP_BLOCKED"
-                        },
-                        status=status.HTTP_403_FORBIDDEN
-                    )
+                # BLOCK CHECK
+                block_response = check_otp_blocked(user, current_time)
+                if block_response:
+                    return block_response
 
-                # COOLDOWN CHECK (60 seconds)
-                if user.otp_last_sent_at and current_time < user.otp_last_sent_at + timedelta(seconds=60):
-                    remaining = int(
-                        (user.otp_last_sent_at + timedelta(seconds=60) - current_time).total_seconds()
-                    )
-                    return Response(
-                        {
-                            "success": False,
-                            "error": f"Please wait {remaining} seconds before requesting another OTP.",
-                            "code": "OTP_COOLDOWN"
-                        },
-                        status=status.HTTP_429_TOO_MANY_REQUESTS
-                    )
+                # COOLDOWN CHECK
+                cooldown_response = check_otp_cooldown(user, current_time)
+                if cooldown_response:
+                    return cooldown_response
 
                 # CONTEXT CHECK
                 if not user.otp_context:
@@ -543,10 +510,9 @@ class ResendOTPView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        except Exception:
-            return Response(
-                {
-                    "success": False,
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Unexpected error in resend OTP for {email}: {str(e)}", exc_info=True)
                     "error": "Something went wrong"
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

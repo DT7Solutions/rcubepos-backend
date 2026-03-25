@@ -1,8 +1,9 @@
-import random
+import secrets
 from django.core.mail import send_mail
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework.response import Response
 import requests
 import json
 
@@ -15,9 +16,10 @@ def get_tokens_for_user(user):
         'refresh_token': str(refresh),
     }
 
-# ----------------------------- OTP GENERATION -----------------------------
+# ----------------------------- OTP GENERATION (Cryptographically Secure) -----------------------------
 def generate_otp(length=6):
-    return ''.join([str(random.randint(0, 9)) for _ in range(length)])
+    """Generate a cryptographically secure OTP using secrets module"""
+    return ''.join([str(secrets.randbelow(10)) for _ in range(length)])
 
 # ----------------------------- GENERIC EMAIL SENDER -----------------------------
 def send_email(subject, to_email, text_content, html_content=None):
@@ -108,35 +110,13 @@ def send_otp_email(user_email, otp_code, context="default"):
         html_content=html_content,
     )
 
-# def send_mobial_otp(mobile, otp):
-#     url = "https://www.fast2sms.com/dev/bulkV2"
-#     payload = {
-        
-#         "route" : "otp",
-#         "variables_values" : "123456",
-#         "numbers" : "9985462090",
-#         # "route": "otp",
-#         # "variables_values": otp,
-#         # "numbers":mobile
-#     }
+# Mobile OTP function (not implemented)
+# def send_mobile_otp(mobile, otp):
+#     """Send OTP via SMS - requires FAST2SMS configuration"""
+#     # Implementation pending - configure with SMS provider credentials
+#     pass
 
-#     headers = {
-        
-#        "authorization":"LOZC9VFJiSaMe2DGE4uzkXngTqv07d1xwjh5BW3Uo86RysAtQNIw4OVfF57D6rySmh12sRLqYWdcl0ni",
-#         # "authorization": settings.FAST2SMS_API_KEY, 
-#         "Content-Type": "application/json"
-#     }
-
-#     try:
-#         response = requests.post(url, headers=headers, data=json.dumps(payload))
-#         response.raise_for_status()
-#         print(response.text)
-#         return response.text
-#     except requests.exceptions.RequestException as e:
-#         print(f"Error: {e}")
-#         return str(e)
-
-# ------------------------------ ERROR HANDLING HELPER ----------------------------- 
+# ------------------------------ ERROR HANDLING HELPER -----------------------------
 def error_response(message, code=None, details=None, status_code=400, extra=None):
     response = {
         "success": False,
@@ -150,3 +130,75 @@ def error_response(message, code=None, details=None, status_code=400, extra=None
 
     return Response(response, status=status_code)
 
+
+# ============================= OTP HELPER FUNCTIONS =============================
+
+def check_otp_blocked(user, current_time):
+    """
+    Check if user's OTP attempts are blocked.
+    Returns error_response if blocked, None otherwise.
+    """
+    if user.otp_blocked_until and current_time < user.otp_blocked_until:
+        return error_response(
+            "Too many failed OTP attempts. Try again later.",
+            code="OTP_BLOCKED",
+            status_code=403,
+            extra={"blocked_until": str(user.otp_blocked_until)}
+        )
+    return None
+
+
+def check_otp_cooldown(user, current_time):
+    """
+    Check if OTP request is within cooldown period.
+    Returns error_response with remaining time if blocked, None otherwise.
+    """
+    from datetime import timedelta
+
+    cooldown_seconds = settings.OTP_COOLDOWN_SECONDS
+    if user.otp_last_sent_at and current_time < user.otp_last_sent_at + timedelta(seconds=cooldown_seconds):
+        remaining = int(
+            (user.otp_last_sent_at + timedelta(seconds=cooldown_seconds) - current_time).total_seconds()
+        )
+        return error_response(
+            f"Please wait {remaining} seconds before requesting OTP.",
+            code="OTP_COOLDOWN",
+            status_code=429
+        )
+    return None
+
+
+def check_otp_expired(user, current_time):
+    """
+    Check if OTP has expired.
+    Returns error_response if expired, None otherwise.
+    """
+    from datetime import timedelta
+
+    expiry_minutes = settings.OTP_EXPIRY_MINUTES
+    if not user.otp_created_at or current_time > user.otp_created_at + timedelta(minutes=expiry_minutes):
+        return error_response(
+            "OTP expired. Please request a new one.",
+            code="OTP_EXPIRED",
+            status_code=400
+        )
+    return None
+
+
+def reset_otp_fields(user, full_reset=True):
+    """
+    Reset OTP-related fields on user object (does not save).
+
+    Args:
+        user: User instance
+        full_reset: If True, resets everything. If False, only resets OTP code/context.
+    """
+    user.otp = None
+    user.otp_created_at = None
+    user.otp_context = None
+
+    if full_reset:
+        user.otp_attempts = 0
+        user.otp_blocked_until = None
+
+ 

@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-ia35agc!--gj$1u%w0nfu@!x^i*98%+%g$ut9h_7%in6chwdtd'
+SECRET_KEY = config('SECRET_KEY', default='django-insecure-dev-key-change-in-production')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -197,7 +197,7 @@ REST_FRAMEWORK = {
 
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'  
+EMAIL_HOST = 'smtp.gmail.com'
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 EMAIL_HOST_USER = config('EMAIL_HOST_USER')
@@ -207,3 +207,20 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL')
 
 # RAZORPAY_KEY_ID  = config('RAZORPAY_KEY_ID')
 # RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET')
+
+# ==================== OTP CONFIGURATION ====================
+OTP_LENGTH = config('OTP_LENGTH', default=6, cast=int)
+OTP_EXPIRY_MINUTES = config('OTP_EXPIRY_MINUTES', default=10, cast=int)
+OTP_MAX_ATTEMPTS = config('OTP_MAX_ATTEMPTS', default=5, cast=int)
+OTP_BLOCK_DURATION_HOURS = config('OTP_BLOCK_DURATION_HOURS', default=6, cast=int)
+OTP_COOLDOWN_SECONDS = config('OTP_COOLDOWN_SECONDS', default=60, cast=int)
+
+# OTP Context Types
+OTP_CONTEXT_REGISTER = 'register'
+OTP_CONTEXT_CHANGE_PASSWORD = 'change_password'
+OTP_CONTEXT_CHANGE_EMAIL_OLD = 'change_email_old'
+OTP_CONTEXT_CHANGE_EMAIL_NEW = 'change_email_new'
+
+# ==================== SUBSCRIPTION CONFIGURATION ====================
+SUBSCRIPTION_MONTHLY_DAYS = config('SUBSCRIPTION_MONTHLY_DAYS', default=30, cast=int)
+SUBSCRIPTION_YEARLY_DAYS = config('SUBSCRIPTION_YEARLY_DAYS', default=365, cast=int)
