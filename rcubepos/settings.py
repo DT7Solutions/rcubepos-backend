@@ -25,17 +25,22 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-ia35agc!--gj$1u%w0nfu@!x^i*98%+%g$ut9h_7%in6chwdtd'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# DEBUG = True
+DEBUG = False
 
-ALLOWED_HOSTS = ["*"]
+# ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = ["91.108.110.206", "rcubepos.codkraft.com", "localhost", "127.0.0.1"]
 
 CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:8080",
+    # "http://localhost:8080",
+    "https://rcubepos.codkraft.com",
+
 ]
 
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:8080",
+    # "http://localhost:8080",
+    "https://rcubepos.codkraft.com",
 ]
 
 
