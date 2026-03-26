@@ -12,6 +12,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from drf_yasg.utils import swagger_auto_schema
 
+from django.views.decorators.csrf import csrf_exempt
+
 from django.utils.timezone import now
 from django.db import transaction
 from datetime import timedelta
@@ -28,6 +30,7 @@ from .utils import *
 class RegisterView(APIView):
     permission_classes = [permissions.AllowAny]
 
+    @csrf_exempt
     @swagger_auto_schema(request_body=RegisterSerializer)
     def post(self, request):
         """
@@ -119,6 +122,7 @@ class RegisterView(APIView):
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
+    @csrf_exempt
     @swagger_auto_schema(request_body=LoginSerializer)
     def post(self, request):
         try:
