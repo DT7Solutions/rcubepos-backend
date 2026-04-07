@@ -28,6 +28,13 @@ urlpatterns = [
     path('auth/forgot-password/', ForgotPasswordView.as_view()),
     path('auth/check-availability/', CheckAvailabilityView.as_view()),
 
+    # DASHBOARD FLOW
+    path('dashboard/admin/', AdminDashboardView.as_view()),
+    path('dashboard/owner/', OwnerDashboardView.as_view()),
+
+    # ADMIN FLOW
+    path('admin/transactions/', AdminTransactionListView.as_view()),
+
     # OWNER FLOW
     path('subscriptions/select-plan/', SelectPlanView.as_view()),
     path('subscriptions/me/', MySubscriptionView.as_view()),

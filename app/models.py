@@ -6,6 +6,7 @@ from datetime import date
 from django.utils.timezone import now
 from django.core.exceptions import ValidationError
 from django.db.models import Q
+import uuid
 
 # ========================= # AUTH MODELS # =========================
 
@@ -358,6 +359,7 @@ class PaymentTransaction(models.Model):
         ('refunded', 'Refunded'),
     ]
 
+    transaction_id = models.CharField(max_length=50, unique=True, blank=True, null=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payments')
     subscription = models.ForeignKey(Subscription, on_delete=models.SET_NULL, null=True, blank=True)
 
@@ -391,6 +393,9 @@ class PaymentTransaction(models.Model):
 
     history = HistoricalRecords()
 
+    def generate_transaction_id(self):
+        return f"TXN-{now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+
     def calculate_final_amount(self):
         settings = PlatformSettings.objects.first()
         gst_percent = settings.gst_percent if settings else 0
@@ -401,6 +406,14 @@ class PaymentTransaction(models.Model):
 
     def __str__(self):
         return f"{self.user} - ₹{self.total_amount} - {self.status}"
+    
+    def save(self, *args, **kwargs):
+        if not self.transaction_id:
+            self.transaction_id = self.generate_transaction_id()
+
+        self.calculate_final_amount()
+
+        super().save(*args, **kwargs)
 
     class Meta:
         db_table = 'payment_transactions'

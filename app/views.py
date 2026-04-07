@@ -1,10 +1,12 @@
 from requests import session
 from rest_framework import status, viewsets, permissions, generics 
 from rest_framework.views import APIView, View
+from rest_framework.generics import ListAPIView
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.pagination import PageNumberPagination
 
 from django.contrib.auth import authenticate
 from django.conf import settings
@@ -17,8 +19,12 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
 from django.utils.timezone import now
+from django.utils.dateparse import parse_date
 from django.db import transaction
+from django.db.models import Sum, Count
+from django.db.models.functions import TruncMonth
 from datetime import timedelta, timezone
+# from collections import deafultdict
 import logging
 import stripe
 
@@ -701,7 +707,45 @@ class AdminUserViewSet(viewsets.ModelViewSet):
             "message": "Password reset successfully",
             "temporary_password": new_password
         })
+
+class AdminTransactionListView(ListAPIView):
+
+    class TransactionPagination(PageNumberPagination):
+        page_size = 20
+        page_size_query_param = 'page_size'
+
+    serializer_class = AdminTransactionSerializer
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+    pagination_class = TransactionPagination
+
+    def get_queryset(self):
+        user = self.request.user
+
+        if not user.is_staff:
+            raise PermissionDenied("Admin only")
+
+        queryset = PaymentTransaction.objects.select_related(
+            "user",
+            "subscription__restaurant"
+        ).order_by("-created_at")
+
+        # Optional filters (very useful)
+        status = self.request.query_params.get("status")
+        if status:
+            queryset = queryset.filter(status=status)
+
+        start_date = self.request.query_params.get("start_date")
         
+        if start_date:
+            queryset = queryset.filter(created_at__date__gte=parse_date(start_date))
+
+        end_date = self.request.query_params.get("end_date")
+        if end_date:
+            queryset = queryset.filter(created_at__date__lte=parse_date(end_date))
+
+        return queryset
+
 # ========================= # RESTAURANT VIEWS # =========================
 class RestaurantViewSet(viewsets.ModelViewSet):
     authentication_classes = [JWTAuthentication]
@@ -809,7 +853,85 @@ class RestaurantViewSet(viewsets.ModelViewSet):
         sub, _ = Subscription.objects.get_or_create(restaurant=restaurant)
 
         return Response(OwnerSubscriptionSerializer(sub).data)
-    
+
+# ========================= # DASHBOARD VIEWS # =========================
+class AdminDashboardView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not request.user.is_staff:
+            raise PermissionDenied("Admin only")
+
+        # ================= CARDS =================
+        total_restaurants = Restaurant.objects.filter(is_deleted=False).count()
+
+        active_restaurants = Restaurant.objects.filter(
+            is_deleted=False,
+            status="Active"
+        ).count()
+
+        payments = PaymentTransaction.objects.filter(status="success")
+
+        total_revenue = payments.aggregate(
+            total=Sum("final_amount")
+        )["total"] or 0
+
+        # ================= CHART =================
+        monthly_data = payments.annotate(
+            month=TruncMonth("created_at")
+        ).values("month").annotate(
+            revenue=Sum("final_amount")
+        ).order_by("month")
+
+        # Format for frontend
+        revenue_chart = [
+            {
+                "month": entry["month"].strftime("%b"),
+                "revenue": entry["revenue"]
+            }
+            for entry in monthly_data if entry["month"]
+        ]
+
+        return Response({
+            "cards": {
+                "total_restaurants": total_restaurants,
+                "active_restaurants": active_restaurants,
+                "total_revenue": total_revenue
+            },
+            "revenue_chart": revenue_chart
+        })
+
+class OwnerDashboardView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        sub = Subscription.objects.filter(user=user)\
+            .select_related("plan")\
+            .prefetch_related("invoices")\
+            .first()
+
+        payments = PaymentTransaction.objects.filter(
+            user=user,
+            status="success"
+        )
+
+        total_spent = payments.aggregate(
+            total=Sum("final_amount")
+        )["total"] or 0
+
+        return Response({
+            "subscription": OwnerSubscriptionSerializer(sub).data if sub else None,
+            "total_spent": total_spent,
+            "payments": PaymentTransactionSerializer(
+                payments.order_by("-created_at")[:5],
+                many=True
+            ).data
+        })
+
 # ========================= # SUBSCRIPTION VIEWS # =========================
 
 class MySubscriptionView(APIView):

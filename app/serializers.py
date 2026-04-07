@@ -164,6 +164,35 @@ class AdminUserSerializer(serializers.ModelSerializer):
         restaurant = Restaurant.objects.filter(owner=obj).first()
         return restaurant.name if restaurant else None
 
+class AdminTransactionSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.username", read_only=True)
+    user_email = serializers.CharField(source="user.email", read_only=True)
+
+    final_amount = serializers.FloatField()
+    restaurant_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PaymentTransaction
+        fields = [
+            "id",
+            "transaction_id",
+            "stripe_payment_intent_id",
+            "user_name",
+            "user_email",
+            "restaurant_name",
+            "final_amount",
+            "currency",
+            "payment_method",
+            "status",
+            "created_at",
+            "paid_at",
+        ]
+
+    def get_restaurant_name(self, obj):
+        if obj.subscription and obj.subscription.restaurant:
+            return obj.subscription.restaurant.name
+        return None
+
 # ========================= # RESTAURANT SERIALIZER # =========================
 class RestaurantSerializer(serializers.ModelSerializer):
     owner_name = serializers.CharField(source='owner.username', read_only=True)
@@ -202,7 +231,19 @@ class RestaurantSerializer(serializers.ModelSerializer):
 class InvoiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invoice
-        fields = ['id', 'date', 'amount', 'plan_name', 'status']
+        fields = [
+            'id',
+            'subscription',
+            'date',
+            'base_amount',
+            'discount_amount',
+            'gst_amount',
+            'total_amount',
+            'plan_name',
+            'plan_interval',
+            'status'
+        ]
+        read_only_fields = ['id', 'date']
 
 class OwnerSubscriptionSerializer(serializers.ModelSerializer):
     plan_id = serializers.IntegerField(source='plan.id', read_only=True)
@@ -302,8 +343,46 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
 
         return data
 
+# ========================= # PAYMENT SERIALIZER # =========================
+class PaymentTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaymentTransaction
+        fields = [
+            'id',
+            'user',
+            'subscription',
+            'status',
+            'base_amount',
+            'discount_amount',
+            'gst_amount',
+            'final_amount',
+            'refunded_amount',
+            'payment_method',
+            'currency',
+            'stripe_session_id',
+            'stripe_payment_intent_id',
+            'stripe_charge_id',
+            'created_at',
+            'paid_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'paid_at']
+
+class RefundSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Refund
+        fields = [
+            'id',
+            'payment_transaction',
+            'amount',
+            'reason',
+            'stripe_refund_id',
+            'created_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'stripe_refund_id']
+
 # ========================= # PLATFORM SERIALIZER # =========================
 class PlatformSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = PlatformSettings
         fields = ['gst_percent', 'currency']
+
