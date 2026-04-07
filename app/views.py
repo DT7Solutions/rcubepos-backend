@@ -13,6 +13,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from drf_yasg.utils import swagger_auto_schema
 
+from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
 from django.utils.timezone import now
@@ -994,6 +995,7 @@ class StripeWebhookView(APIView):
             )
 
 # Fallback if Webhook Fails
+@method_decorator(csrf_exempt, name='dispatch')
 class VerifyPaymentView(APIView):
     permission_classes = [AllowAny]
 
