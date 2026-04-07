@@ -43,6 +43,9 @@ CORS_ALLOWED_ORIGINS = [
     "https://rcubepos.codkraft.com",
 ]
 
+# FRONTEND_URL = "http://localhost:8080"
+FRONTEND_URL = "https://rcubepos.codkraft.com"
+
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -53,7 +56,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'app',
     'rest_framework',
-    'corsheaders',
+    'corsheaders', 
     'drf_yasg',
     'simple_history',
 ]
@@ -209,9 +212,10 @@ EMAIL_HOST_USER = config('EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD =config('EMAIL_HOST_PASSWORD')
 DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL')
 
-
-# RAZORPAY_KEY_ID  = config('RAZORPAY_KEY_ID')
-# RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET')
+# ==================== STRIPE CONFIGURATION ====================
+STRIPE_SECRET_KEY  = config('STRIPE_SECRET_KEY')
+STRIPE_PUBLISHABLE_KEY = config('STRIPE_PUBLISHABLE_KEY')
+STRIPE_WEBHOOK_SECRET = config('STRIPE_WEBHOOK_SECRET')
 
 # ==================== OTP CONFIGURATION ====================
 OTP_LENGTH = config('OTP_LENGTH', default=6, cast=int)
