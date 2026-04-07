@@ -657,16 +657,13 @@ class AdminUserViewSet(viewsets.ModelViewSet):
             raise ValidationError("Name and email are required.")
 
         user = User.objects.create_user(
-            username=email,
             email=email,
+            username=email,
+            phone=phone or "",
             password=password,
-            first_name=name,
         )
-
-        # Optional phone
-        if phone:
-            user.phone = phone
-            user.save()
+        user.first_name = name
+        user.save()
 
         # Create restaurant
         if restaurant_name:
@@ -729,9 +726,9 @@ class RestaurantViewSet(viewsets.ModelViewSet):
         restaurant = serializer.save(owner=self.request.user)
 
         # Attach subscription to restaurant
-        sub = Subscription.objects.filter(user = self.request.user).first()
+        sub = Subscription.objects.filter(user=self.request.user).first()
         
-        if sub:
+        if sub and not sub.restaurant:
             sub.restaurant = restaurant
             sub.save()
 
@@ -781,7 +778,10 @@ class RestaurantViewSet(viewsets.ModelViewSet):
         except SubscriptionPlan.DoesNotExist:
             raise ValidationError({"plan_id": "Invalid plan ID."})
 
-        sub, created = Subscription.objects.get_or_create(restaurant=restaurant)
+        sub, created = Subscription.objects.get_or_create(
+            restaurant=restaurant,
+            defaults={'user': restaurant.owner}
+        )
 
         sub.plan = plan
         sub.status = 'active'
@@ -1043,7 +1043,7 @@ class VerifyPaymentView(APIView):
                 return Response({"error": "Subscription not found for this session"}, status=404)
 
             # FIXED ownership check
-            if str(user_id) != str(sub.user.id):
+            if str(user_id) != str(sub.user_id):
                 return Response({"error": "Unauthorized! Session user mismatch"}, status=403)
 
             # Idempotency

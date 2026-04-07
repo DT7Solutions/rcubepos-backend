@@ -1,5 +1,6 @@
 from rest_framework.permissions import BasePermission
 from django.utils.timezone import now, timedelta
+from .models import Subscription
 
 class IsSubscriptionActive(BasePermission):
     """
@@ -15,7 +16,7 @@ class IsSubscriptionActive(BasePermission):
         if not user.is_authenticated:
             return False
 
-        subscription = (subscription.objects.filter(user=user).select_related('plan').first())
+        subscription = Subscription.objects.filter(user=user).select_related('plan').first()
         
         if not subscription or not subscription.plan:
             return False

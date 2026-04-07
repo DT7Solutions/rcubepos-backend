@@ -267,11 +267,8 @@ class Subscription(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='subscriptions')
     plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True)
 
-    # Stripe fields
-    stripe_session_id = models.CharField(max_length=255, blank=True, null=True)
-    stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
-
     last_session_created_at = models.DateTimeField(blank=True, null=True)
+    last_payment = models.ForeignKey('PaymentTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='subscriptions')
     
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='none')
 
@@ -313,8 +310,19 @@ class Invoice(models.Model):
     stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
     
     date = models.DateField(auto_now_add=True)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    base_amount = models.DecimalField(max_digits=10, decimal_places=2)
     plan_name = models.CharField(max_length=50)
+    plan_interval = models.CharField(max_length=10, choices=SubscriptionPlan.INTERVAL_CHOICES, default='monthly')
+
+    invoice_number = models.CharField(max_length=50, unique=True, null=True, blank=True)
+
+    coupon_code = models.CharField(max_length=50, blank=True, null=True)
+    discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    payment = models.OneToOneField('PaymentTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoice')
+    gst_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    billing_details = models.JSONField(default=dict, blank=True)
 
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
 
@@ -323,7 +331,7 @@ class Invoice(models.Model):
     history = HistoricalRecords()
 
     def __str__(self):
-        return f"Invoice {self.id} - {self.plan_name} - ₹{self.amount} - {self.status}"
+        return f"Invoice {self.id} - {self.plan_name} - ₹{self.total_amount} - {self.status}"
 
     class Meta:
         db_table = 'invoices'
@@ -340,6 +348,112 @@ class PlatformSettings(models.Model):
         verbose_name_plural = 'Platform Settings'
         db_table = 'platform_settings'
 
-# ========================= # OTHER MODELS (e.g., Audit Logs) can be added here =========================
+# ========================= # PAYMENT MODELS # =========================
+
+class PaymentTransaction(models.Model):
+    PAYMENT_STATUS = [
+        ('initiated', 'Initiated'),
+        ('success', 'Success'),
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payments')
+    subscription = models.ForeignKey(Subscription, on_delete=models.SET_NULL, null=True, blank=True)
+
+    # Stripe Data
+    stripe_session_id = models.CharField(max_length=255, blank=True, null=True)
+    stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
+    stripe_charge_id = models.CharField(max_length=255, blank=True, null=True)
+
+    currency = models.CharField(max_length=10, default='INR')
+    base_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    
+    coupon_code = models.CharField(max_length=50, blank=True, null=True)
+    discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    gst_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    
+    final_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default='initiated')
+
+    payment_method = models.CharField(max_length=50, blank=True, null=True)
+
+    failure_reason = models.TextField(blank=True, null=True)
+
+    refunded_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    paid_at = models.DateTimeField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    history = HistoricalRecords()
+
+    def calculate_final_amount(self):
+        settings = PlatformSettings.objects.first()
+        gst_percent = settings.gst_percent if settings else 0
+
+        self.total_amount = self.base_amount - self.discount_amount
+        self.gst_amount = self.total_amount * gst_percent / 100
+        self.final_amount = self.total_amount + self.gst_amount
+
+    def __str__(self):
+        return f"{self.user} - ₹{self.total_amount} - {self.status}"
+
+    class Meta:
+        db_table = 'payment_transactions'
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['stripe_payment_intent_id']),
+            models.Index(fields=['created_at']),
+            models.Index(fields=['user']),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=['stripe_payment_intent_id'], name='unique_stripe_payment_intent')
+        ]
+
+class Refund(models.Model):
+    payment = models.ForeignKey(PaymentTransaction, on_delete=models.CASCADE, related_name='refunds')
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    reason = models.TextField(blank=True, null=True)
+    stripe_refund_id = models.CharField(max_length=255, blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    history = HistoricalRecords()
+
+    def clean(self):
+        total_refunded = sum(r.amount for r in self.payment.refunds.all())
+        if total_refunded + self.amount > self.payment.final_amount:
+            raise ValidationError({'amount': 'Refund amount cannot exceed the remaining payment amount.'})
+
+    def __str__(self):
+        return f"Refund for {self.payment} - ₹{self.amount}"
+
+    class Meta:
+        db_table = 'refunds'
+
+# ======================== # STRIPE MODELS # ========================
+
+class StripeWebhookLog(models.Model):
+    event_id = models.CharField(max_length=255, unique=True)
+    event_type = models.CharField(max_length=100)
+
+    payload = models.JSONField()
+
+    processed = models.BooleanField(default=False)
+    processing_error = models.TextField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.event_type} - {self.event_id}"
+
+    class Meta:
+        db_table = 'stripe_webhook_logs'
+
+# ========================= # OTHER MODELS =========================
 
 
