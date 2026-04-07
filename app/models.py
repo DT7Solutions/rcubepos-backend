@@ -263,23 +263,33 @@ class Subscription(models.Model):
         ('none', 'None')
     ]
 
+    restaurant = models.OneToOneField(Restaurant, on_delete=models.CASCADE, related_name='subscription', null=True, blank=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='subscriptions')
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True)
+
+    # Stripe fields
+    stripe_session_id = models.CharField(max_length=255, blank=True, null=True)
+    stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
+
+    last_session_created_at = models.DateTimeField(blank=True, null=True)
+    
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='none')
+
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+
+    # Audit fields
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    history = HistoricalRecords()
+
     def get_status(self):
         if not self.plan:
             return 'none'
         if self.end_date and self.end_date < now().date():
             return 'expired'
         return 'active'
-
-    restaurant = models.OneToOneField(Restaurant, on_delete=models.CASCADE, related_name='subscription', null=True, blank=True)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='subscriptions')
-    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True)
-
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='none')
-
-    start_date = models.DateField(null=True, blank=True)
-    end_date = models.DateField(null=True, blank=True)
-
-    history = HistoricalRecords()
 
     class Meta:
         db_table = 'subscriptions'
@@ -294,18 +304,26 @@ class Subscription(models.Model):
 class Invoice(models.Model):
     STATUS_CHOICES = [
         ('paid', 'Paid'),
-        ('pending', 'Pending')
+        ('pending', 'Pending'),
+        ('failed', 'Failed')
     ]
 
     subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='invoices')
 
+    stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
+    
     date = models.DateField(auto_now_add=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     plan_name = models.CharField(max_length=50)
 
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
 
+    created_at = models.DateTimeField(auto_now_add=True)
+
     history = HistoricalRecords()
+
+    def __str__(self):
+        return f"Invoice {self.id} - {self.plan_name} - ₹{self.amount} - {self.status}"
 
     class Meta:
         db_table = 'invoices'
@@ -322,6 +340,6 @@ class PlatformSettings(models.Model):
         verbose_name_plural = 'Platform Settings'
         db_table = 'platform_settings'
 
-
+# ========================= # OTHER MODELS (e.g., Audit Logs) can be added here =========================
 
 

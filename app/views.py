@@ -1,8 +1,9 @@
+from requests import session
 from rest_framework import status, viewsets, permissions, generics 
-from rest_framework.views import APIView
+from rest_framework.views import APIView, View
 from rest_framework.response import Response
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from django.contrib.auth import authenticate
@@ -18,10 +19,12 @@ from django.utils.timezone import now
 from django.db import transaction
 from datetime import timedelta
 import logging
+import stripe
 
 from .models import *
 from .serializers import *
 from .utils import *
+from .permissions import *
 
 # Create your views here.
 
@@ -731,6 +734,17 @@ class RestaurantViewSet(viewsets.ModelViewSet):
             sub.restaurant = restaurant
             sub.save()
 
+    # ================= UPDATE & DELETE PERMISSIONS =================
+    def get_permissions(self):
+        user = self.request.user
+
+        if user.is_staff:
+            return [IsAuthenticated()]
+
+        if self.action in ['list', 'retrieve', 'create']:
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), IsSubscriptionActive()]
+
     # ================= TOGGLE STATUS =================
     @action(detail=True, methods=['patch'])
     def toggle_status(self, request, pk=None):
@@ -796,6 +810,7 @@ class RestaurantViewSet(viewsets.ModelViewSet):
         return Response(OwnerSubscriptionSerializer(sub).data)
     
 # ========================= # SUBSCRIPTION VIEWS # =========================
+
 class MySubscriptionView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
@@ -814,8 +829,7 @@ class MySubscriptionView(APIView):
         status = sub.get_status()
 
         if status != sub.status:
-            sub.status = status
-            sub.save(update_fields=['status'])        
+            Subscription.objects.filter(id=sub.id).update(status=status)       
 
         return Response({
             "status": status,
@@ -860,14 +874,12 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         instance.is_active = False
         instance.save()
 
-class SelectPlanView(APIView):
+class CreateCheckoutSessionView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
 
-    @swagger_auto_schema(request_body=ChangePlanSerializer)
     def post(self, request):
         user = request.user
-
         plan_id = request.data.get("plan_id")
 
         if not plan_id:
@@ -878,11 +890,214 @@ class SelectPlanView(APIView):
         except SubscriptionPlan.DoesNotExist:
             return Response({"error": "Invalid plan"}, status=400)
 
+        sub, _ = Subscription.objects.get_or_create(user=user)
+
+        # 🔒 Block only if actually paid
+        if sub.stripe_payment_intent_id:
+            return Response(
+                {"error": "You already have an active subscription"},
+                status=400
+            )
+
+        # ✅ Always allow retry
+        session = create_checkout_session(user, plan)
+
+        # ✅ ONLY store session (NOT plan)
+        sub.stripe_session_id = session.id
+        sub.last_session_created_at = now()
+        sub.save(update_fields=["stripe_session_id", "last_session_created_at"])
+
+        return Response({
+            "url": session.url,
+            "session_id": session.id
+        })
+
+# Implement Webhook Later
+class StripeWebhookView(APIView):
+    permission_classes = [AllowAny]  # AllowAny (no auth)
+
+    def post(self, request):
+        payload = request.body
+        sig_header = request.META.get("HTTP_STRIPE_SIGNATURE")
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload,
+                sig_header,
+                settings.STRIPE_WEBHOOK_SECRET
+            )
+        except stripe.error.SignatureVerificationError:
+            return JsonResponse({"error": "Invalid signature"}, status=400)
+        except Exception:
+            return JsonResponse({"error": "Invalid payload"}, status=400)
+
+        # Handle only relevant event
+        if event["type"] == "checkout.session.completed":
+            session = event["data"]["object"]
+            self.handle_successful_payment(session)
+
+        return JsonResponse({"status": "success"})
+
+    # Combined logic
+    def handle_successful_payment(self, session):
+        session_id = session.get("id")
+        payment_intent = session.get("payment_intent")
+
+        metadata = session.get("metadata", {})
+        plan_id = metadata.get("plan_id")
+        user_id = metadata.get("user_id")
+
+        if not session_id or not payment_intent:
+            return
+
+        try:
+            plan = SubscriptionPlan.objects.get(id=plan_id)
+        except SubscriptionPlan.DoesNotExist:
+            return
+
+        with transaction.atomic():
+            try:
+                sub = Subscription.objects.select_for_update().get(
+                    stripe_session_id=session_id
+                )
+            except Subscription.DoesNotExist:
+                return
+
+            # Idempotency
+            if sub.stripe_payment_intent_id:
+                return
+
+            # Safety check
+            if str(user_id) != str(sub.user_id):
+                return
+
+            # Activate subscription
+            sub.plan = plan
+            sub.status = "active"
+            sub.start_date = now().date()
+
+            if plan.interval == "monthly":
+                sub.end_date = sub.start_date + timedelta(days=30)
+            else:
+                sub.end_date = sub.start_date + timedelta(days=365)
+
+            sub.stripe_payment_intent_id = payment_intent
+            sub.save()
+
+            # Create invoice
+            Invoice.objects.create(
+                subscription=sub,
+                amount=plan.price,
+                plan_name=plan.name,
+                status="paid",
+                stripe_payment_intent_id=payment_intent
+            )
+
+# Fallback if Webhook Fails
+class VerifyPaymentView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        session_id = request.data.get("session_id")
+
+        if not session_id:
+            return Response({"error": "session_id required"}, status=400)
+
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+        except Exception:
+            return Response({"error": "Invalid session"}, status=400)
+
+        if session.payment_status != "paid":
+            return Response({"error": "Payment not completed"}, status=400)
+
+        if not session.payment_intent:
+            return Response({"error": "Payment intent not found"}, status=400)
+
+        # ✅ FIXED metadata handling
+        metadata = session.metadata if session.metadata else {}
+        print("METADATA:", metadata)
+
+        plan_id = metadata.plan_id if hasattr(metadata, 'plan_id') else metadata.get("plan_id")
+        user_id = metadata.user_id if hasattr(metadata, 'user_id') else metadata.get("user_id")
+
+        print("RAW METADATA:", session.metadata)
+        print("PLAN:", getattr(session.metadata, "plan_id", None))
+
+        if not plan_id or not user_id:
+            return Response({"error": "Invalid metadata"}, status=400)
+
+        try:
+            plan = SubscriptionPlan.objects.get(id=plan_id)
+        except SubscriptionPlan.DoesNotExist:
+            return Response({"error": "Plan not found"}, status=400)
+
+        with transaction.atomic():
+            try:
+                sub = Subscription.objects.select_for_update().get(
+                    stripe_session_id=session_id
+                )
+            except Subscription.DoesNotExist:
+                return Response({"error": "Subscription not found for this session"}, status=404)
+
+            # FIXED ownership check
+            if str(user_id) != str(sub.user.id):
+                return Response({"error": "Unauthorized! Session user mismatch"}, status=403)
+
+            # Idempotency
+            if sub.stripe_payment_intent_id:
+                return Response({"message": "Subscription already activated for this session"})
+
+            # Activate subscription
+            sub.plan = plan
+            sub.status = "active"
+            sub.start_date = now().date()
+
+            if plan.interval == "monthly":
+                sub.end_date = sub.start_date + timedelta(days=30)
+            else:
+                sub.end_date = sub.start_date + timedelta(days=365)
+
+            sub.stripe_payment_intent_id = session.payment_intent
+            sub.save()
+
+            Invoice.objects.create(
+                subscription=sub,
+                amount=plan.price,
+                plan_name=plan.name,
+                stripe_payment_intent_id=session.payment_intent,
+                status='paid'
+            )
+
+        return Response({"message": "Subscription activated successfully"})
+
+# Remove This
+class SelectPlanView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(request_body=ChangePlanSerializer)
+    def post(self, request):
+        user = request.user
+        plan_id = request.data.get("plan_id")
+
+        if not plan_id:
+            return Response({"error": "plan_id is required"}, status=400)
+
+        try:
+            plan = SubscriptionPlan.objects.get(id=plan_id, is_active=True)
+        except SubscriptionPlan.DoesNotExist:
+            return Response({"error": "Invalid plan"}, status=400)
+
+        # Create Stripe Checkout Session
+        session = create_checkout_session(user, plan)
+
         # Get or create subscription for user
         sub, _ = Subscription.objects.get_or_create(user=user)
 
         sub.plan = plan
-        sub.status = "active"
+        sub.status = "none"
+        sub.status_session_id = session.id
         sub.start_date = now().date()
 
         # duration

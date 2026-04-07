@@ -208,18 +208,28 @@ class OwnerSubscriptionSerializer(serializers.ModelSerializer):
     plan_id = serializers.IntegerField(source='plan.id', read_only=True)
     plan_name = serializers.CharField(source='plan.name', read_only=True)
 
+    status = serializers.SerializerMethodField()
+    is_active = serializers.SerializerMethodField()
+
     invoices = InvoiceSerializer(many=True, read_only=True)
 
     class Meta:
         model = Subscription
         fields = [
             'status',
+            'is_active',
             'plan_id',
             'plan_name',
             'start_date',
             'end_date',
             'invoices',
         ]
+
+    def get_status(self, obj):
+        return obj.get_status()
+    
+    def get_is_active(self, obj):
+        return obj.get_status() == 'active'
 
 class ChangePlanSerializer(serializers.Serializer):
     plan_id = serializers.IntegerField()

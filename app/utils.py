@@ -1,11 +1,15 @@
 import secrets
 from django.core.mail import send_mail
 from django.conf import settings
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+from django.db import transaction
 from django.core.mail import EmailMultiAlternatives
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.response import Response
 import requests
 import json
+import stripe
 
 # ----------------------------- JWT TOKEN GENERATION -----------------------------
 def get_tokens_for_user(user):
@@ -201,4 +205,45 @@ def reset_otp_fields(user, full_reset=True):
         user.otp_attempts = 0
         user.otp_blocked_until = None
 
- 
+# ============================= PAYMENT HELPER FUNCTIONS =============================
+stripe.api_key = settings.STRIPE_SECRET_KEY
+
+
+def create_checkout_session(user, plan):
+    """Create Stripe Checkout Session (one-time payment)"""
+
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            mode='payment',  # FIXED (manual flow)
+
+            customer_email=user.email,
+
+            line_items=[{
+                'price_data': {
+                    'currency': 'inr',  # ✅ match your pricing
+                    'product_data': {
+                        'name': plan.name,
+                    },
+                    'unit_amount': int(plan.price * 100),
+                },
+                'quantity': 1,
+            }],
+
+            metadata={
+                'user_id': str(user.id),  # ✅ always string
+                'plan_id': str(plan.id),
+            },
+
+            success_url=f"{settings.FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{settings.FRONTEND_URL}/subscription/cancelled",
+        )
+
+        return session
+
+    except stripe.error.StripeError as e:
+        # Better error visibility
+        raise Exception(f"Stripe Error: {str(e)}")
+
+    except Exception as e:
+        raise Exception(f"Checkout Session Error: {str(e)}")

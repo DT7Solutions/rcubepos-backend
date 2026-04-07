@@ -31,6 +31,9 @@ urlpatterns = [
     # OWNER FLOW
     path('subscriptions/select-plan/', SelectPlanView.as_view()),
     path('subscriptions/me/', MySubscriptionView.as_view()),
+    path('create-checkout-session/', CreateCheckoutSessionView.as_view()),
+    path('verify-payment/', VerifyPaymentView.as_view()),
+    path("stripe/webhook/", StripeWebhookView.as_view()),
 
     # API
     path('', include(router.urls)),
