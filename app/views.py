@@ -18,7 +18,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from django.utils.timezone import now
 from django.db import transaction
-from datetime import timedelta
+from datetime import timedelta, timezone
 import logging
 import stripe
 
@@ -893,20 +893,26 @@ class CreateCheckoutSessionView(APIView):
 
         sub, _ = Subscription.objects.get_or_create(user=user)
 
-        # 🔒 Block only if actually paid
-        if sub.stripe_payment_intent_id:
-            return Response(
-                {"error": "You already have an active subscription"},
-                status=400
-            )
+        # Block only if actually paid
+        if sub.status == "active":
+            return Response({"error": "You already have an active subscription"}, status=400)
 
-        # ✅ Always allow retry
+        payment = PaymentTransaction.objects.create(
+            user=user,
+            subscription=sub,
+            base_amount=plan.price,
+            status='initiated',
+        )
+        
+        # Always allow retry
         session = create_checkout_session(user, plan)
 
-        # ✅ ONLY store session (NOT plan)
-        sub.stripe_session_id = session.id
+        payment.stripe_session_id = session.id
+        payment.save()
+
+        # ONLY store session
         sub.last_session_created_at = now()
-        sub.save(update_fields=["stripe_session_id", "last_session_created_at"])
+        sub.save(update_fields=["last_session_created_at"])
 
         return Response({
             "url": session.url,
@@ -1023,9 +1029,6 @@ class VerifyPaymentView(APIView):
         plan_id = metadata.plan_id if hasattr(metadata, 'plan_id') else metadata.get("plan_id")
         user_id = metadata.user_id if hasattr(metadata, 'user_id') else metadata.get("user_id")
 
-        print("RAW METADATA:", session.metadata)
-        print("PLAN:", getattr(session.metadata, "plan_id", None))
-
         if not plan_id or not user_id:
             return Response({"error": "Invalid metadata"}, status=400)
 
@@ -1036,20 +1039,26 @@ class VerifyPaymentView(APIView):
 
         with transaction.atomic():
             try:
-                sub = Subscription.objects.select_for_update().get(
-                    stripe_session_id=session_id
-                )
-            except Subscription.DoesNotExist:
-                return Response({"error": "Subscription not found for this session"}, status=404)
+                payment = PaymentTransaction.objects.select_for_update().get(stripe_session_id=session_id)
+            except PaymentTransaction.DoesNotExist:
+                return Response({"error": "Payment transaction not found"}, status=404)
+            
+            sub = payment.subscription
 
             # FIXED ownership check
             if str(user_id) != str(sub.user_id):
                 return Response({"error": "Unauthorized! Session user mismatch"}, status=403)
 
             # Idempotency
-            if sub.stripe_payment_intent_id:
+            if payment.status == "success":
                 return Response({"message": "Subscription already activated for this session"})
 
+            payment.calculate_final_amount()
+            payment.stripe_payment_intent_id = session.payment_intent
+            payment.status = "success"
+            payment.paid_at = now()
+            payment.save()
+            
             # Activate subscription
             sub.plan = plan
             sub.status = "active"
@@ -1060,15 +1069,21 @@ class VerifyPaymentView(APIView):
             else:
                 sub.end_date = sub.start_date + timedelta(days=365)
 
-            sub.stripe_payment_intent_id = session.payment_intent
+            sub.last_payment = payment
             sub.save()
 
             Invoice.objects.create(
                 subscription=sub,
-                amount=plan.price,
+                payment=payment,
+                base_amount=payment.base_amount,
+                discount_amount=payment.discount_amount,
+                gst_amount=payment.gst_amount,
+                total_amount=payment.final_amount,
                 plan_name=plan.name,
-                stripe_payment_intent_id=session.payment_intent,
-                status='paid'
+                plan_interval=plan.interval,
+                stripe_payment_intent_id=payment.stripe_payment_intent_id,
+                status='paid',
+                invoice_number = f"INV-{payment.id}-{int(now().timestamp())}"
             )
 
         return Response({"message": "Subscription activated successfully"})
