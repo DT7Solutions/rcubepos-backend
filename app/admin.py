@@ -33,7 +33,7 @@ class RestaurantAdmin(admin.ModelAdmin):
 # ================= SUBSCRIPTION =================
 @admin.register(SubscriptionPlan)
 class SubscriptionPlanAdmin(admin.ModelAdmin):
-    list_display = ('id', 'name', 'price', 'interval', 'is_active', 'popular')
+    list_display = ('id', 'name', 'interval', 'is_active', 'popular')
     list_filter = ('interval', 'is_active')
 
 
@@ -74,7 +74,6 @@ class PaymentTransactionAdmin(admin.ModelAdmin):
     readonly_fields = (
         'stripe_session_id',
         'stripe_payment_intent_id',
-        'stripe_charge_id',
         'created_at',
         'paid_at'
     )

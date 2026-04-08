@@ -210,7 +210,7 @@ class SubscriptionPlan(models.Model):
     INTERVAL_CHOICES = [('monthly', 'Monthly'), ('yearly', 'Yearly')]
 
     name = models.CharField(max_length=50)
-    price = models.DecimalField(max_digits=10, decimal_places=2)
+    # price = models.DecimalField(max_digits=10, decimal_places=2)
     interval = models.CharField(max_length=10, choices=INTERVAL_CHOICES, default='monthly')
     features = models.JSONField(default=list)
     popular = models.BooleanField(default=False)
@@ -249,14 +249,38 @@ class SubscriptionPlan(models.Model):
                 raise ValidationError({'features': 'Feature names must be under 255 characters.'})
 
     def __str__(self):
-        return f"{self.name} - ₹{self.price}/{self.interval}"
+        return f"{self.name} ({self.interval})"
     
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=['name', 'interval'], name='unique_plan_per_interval')
         ]
-        ordering = ['price']
+
+class PlanPricing(models.Model):
+    plan = models.ForeignKey('SubscriptionPlan', on_delete=models.CASCADE, related_name='pricings')
+    country = models.CharField(max_length=2)
+    currency = models.CharField(max_length=10)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    stripe_price_id = models.CharField(max_length=255, blank=True, null=True)
+
+    is_active = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def clean(self):
+        if self.price < 0:
+            raise ValidationError("Price cannot be negative.")
+        if len(self.country) != 2:
+            raise ValidationError("Country code must be ISO based 2 characters.")
+        
+    def __str__(self):
+        return f"{self.plan.name} - {self.country} {self.currency} {self.price}"
     
+    class Meta:
+        unique_together = ('plan', 'country')
+
 class Subscription(models.Model):
     STATUS_CHOICES = [
         ('active', 'Active'),
@@ -322,6 +346,7 @@ class Invoice(models.Model):
     payment = models.OneToOneField('PaymentTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoice')
     gst_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    currency = models.CharField(max_length=10, default='USD')
 
     billing_details = models.JSONField(default=dict, blank=True)
 
@@ -332,7 +357,7 @@ class Invoice(models.Model):
     history = HistoricalRecords()
 
     def __str__(self):
-        return f"Invoice {self.id} - {self.plan_name} - ₹{self.total_amount} - {self.status}"
+        return f"Invoice {self.id} - {self.plan_name} - {self.currency} {self.total_amount} - {self.status}"
 
     class Meta:
         db_table = 'invoices'
@@ -366,8 +391,8 @@ class PaymentTransaction(models.Model):
     # Stripe Data
     stripe_session_id = models.CharField(max_length=255, blank=True, null=True)
     stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
-    stripe_charge_id = models.CharField(max_length=255, blank=True, null=True)
 
+    country = models.CharField(max_length=2, blank=True, null=True)
     currency = models.CharField(max_length=10, default='INR')
     base_amount = models.DecimalField(max_digits=10, decimal_places=2)
     
@@ -394,18 +419,21 @@ class PaymentTransaction(models.Model):
     history = HistoricalRecords()
 
     def generate_transaction_id(self):
-        return f"TXN-{now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+        return f"TXN-{now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8].upper()}"
 
     def calculate_final_amount(self):
         settings = PlatformSettings.objects.first()
         gst_percent = settings.gst_percent if settings else 0
 
         self.total_amount = self.base_amount - self.discount_amount
-        self.gst_amount = self.total_amount * gst_percent / 100
+        if self.currency == 'INR':
+            self.gst_amount = self.total_amount * gst_percent / 100
+        else:
+            self.gst_amount = 0
         self.final_amount = self.total_amount + self.gst_amount
 
     def __str__(self):
-        return f"{self.user} - ₹{self.total_amount} - {self.status}"
+        return f"{self.user} - {self.currency} {self.total_amount} - {self.status}"
     
     def save(self, *args, **kwargs):
         if not self.transaction_id:
@@ -422,6 +450,9 @@ class PaymentTransaction(models.Model):
             models.Index(fields=['stripe_payment_intent_id']),
             models.Index(fields=['created_at']),
             models.Index(fields=['user']),
+            models.Index(fields=['currency']),
+            models.Index(fields=['country']),
+            models.Index(fields=['transaction_id']),
         ]
         constraints = [
             models.UniqueConstraint(fields=['stripe_payment_intent_id'], name='unique_stripe_payment_intent')
@@ -430,6 +461,7 @@ class PaymentTransaction(models.Model):
 class Refund(models.Model):
     payment = models.ForeignKey(PaymentTransaction, on_delete=models.CASCADE, related_name='refunds')
     amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=10, default='USD')
     reason = models.TextField(blank=True, null=True)
     stripe_refund_id = models.CharField(max_length=255, blank=True, null=True)
 
@@ -443,7 +475,7 @@ class Refund(models.Model):
             raise ValidationError({'amount': 'Refund amount cannot exceed the remaining payment amount.'})
 
     def __str__(self):
-        return f"Refund for {self.payment} - ₹{self.amount}"
+        return f"Refund for {self.payment} - {self.currency} {self.amount}"
 
     class Meta:
         db_table = 'refunds'

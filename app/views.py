@@ -977,6 +977,46 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
 
         # Owner → only active plans
         return SubscriptionPlan.objects.filter(is_active=True)
+        
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+
+        country = request.query_params.get("country")
+
+        if not country:
+            ip = get_client_ip(request)
+            country = get_country_from_ip(ip)
+
+            print("IP:", ip)
+            print("Country:", country)
+
+        if not country:
+            country = "US"
+
+        pricing_qs = PlanPricing.objects.filter(country=country, is_active=True)
+        pricing_map = {p.plan_id: p for p in pricing_qs}
+
+        # fallback
+        missing_ids = set(queryset.values_list('id', flat=True)) - set(pricing_map.keys())
+
+        if missing_ids:
+            fallback_qs = PlanPricing.objects.filter(
+                plan_id__in=missing_ids,
+                is_active=True
+            ).order_by('price')
+            for p in fallback_qs:
+                pricing_map[p.plan_id] = p
+
+        serializer = self.get_serializer(
+            queryset,
+            many=True,
+            context={"pricing_map": pricing_map}
+        )
+
+        return Response({
+            "country": country,
+            "plans": serializer.data
+        })
     
     # ================= PERMISSIONS =================
     def perform_create(self, serializer):
@@ -997,6 +1037,35 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         instance.is_active = False
         instance.save()
 
+class PlanPricingViewSet(viewsets.ModelViewSet):
+    queryset = PlanPricing.objects.all()
+    serializer_class = PlanPricingSerializer
+
+    def get_queryset(self):
+        plan_id = self.request.query_params.get("plan")
+
+        qs = PlanPricing.objects.all()
+
+        if plan_id:
+            qs = qs.filter(plan_id=plan_id)
+
+        return qs
+
+    def perform_create(self, serializer):
+        if not self.request.user.is_staff:
+            raise PermissionDenied("Admin only")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        if not self.request.user.is_staff:
+            raise PermissionDenied("Admin only")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not self.request.user.is_staff:
+            raise PermissionDenied("Admin only")
+        instance.delete()
+
 class CreateCheckoutSessionView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
@@ -1015,30 +1084,47 @@ class CreateCheckoutSessionView(APIView):
 
         sub, _ = Subscription.objects.get_or_create(user=user)
 
-        # Block only if actually paid
         if sub.status == "active":
             return Response({"error": "You already have an active subscription"}, status=400)
 
+        # ================= GET COUNTRY =================
+        ip = get_client_ip(request)
+        country = get_country_from_ip(ip)
+
+        # ================= GET PRICING =================
+        pricing = get_plan_pricing(plan, country)
+
+        if not pricing:
+            return Response({"error": "Pricing not available"}, status=400)
+
+        # ================= CREATE PAYMENT =================
         payment = PaymentTransaction.objects.create(
             user=user,
             subscription=sub,
-            base_amount=plan.price,
+            base_amount=pricing.price,
+            currency=pricing.currency,
+            country=pricing.country,
             status='initiated',
         )
-        
-        # Always allow retry
-        session = create_checkout_session(user, plan)
+
+        # ================= STRIPE SESSION =================
+        session = create_checkout_session(
+            user=user,
+            plan=plan,
+            pricing=pricing  # IMPORTANT
+        )
 
         payment.stripe_session_id = session.id
         payment.save()
 
-        # ONLY store session
         sub.last_session_created_at = now()
         sub.save(update_fields=["last_session_created_at"])
 
         return Response({
             "url": session.url,
-            "session_id": session.id
+            "session_id": session.id,
+            "country": country,
+            "currency": pricing.currency
         })
 
 # Implement Webhook Later
@@ -1059,11 +1145,17 @@ class StripeWebhookView(APIView):
             return JsonResponse({"error": "Invalid signature"}, status=400)
         except Exception:
             return JsonResponse({"error": "Invalid payload"}, status=400)
+        
+        event_id = event.get("id")
+
+        if StripeWebhookLog.objects.filter(event_id=event_id).exists():
+            return JsonResponse({"status": "already processed"}, status=200)
 
         # Handle only relevant event
         if event["type"] == "checkout.session.completed":
             session = event["data"]["object"]
             self.handle_successful_payment(session)
+            StripeWebhookLog.objects.create(event_id=event_id, event_type=event["type"], payload=event, processed=True)
 
         return JsonResponse({"status": "success"})
 
@@ -1086,19 +1178,35 @@ class StripeWebhookView(APIView):
 
         with transaction.atomic():
             try:
-                sub = Subscription.objects.select_for_update().get(
-                    stripe_session_id=session_id
-                )
-            except Subscription.DoesNotExist:
+                payment = PaymentTransaction.objects.select_for_update().get(stripe_session_id=session_id)
+            except PaymentTransaction.DoesNotExist:
                 return
 
+            sub = payment.subscription
+
             # Idempotency
-            if sub.stripe_payment_intent_id:
+            if payment.status == "success":
                 return
 
             # Safety check
             if str(user_id) != str(sub.user_id):
                 return
+            
+            # Update Payment
+            try:
+                intent = stripe.PaymentIntent.retrieve(payment_intent)
+            except Exception:
+                return
+
+            if intent.charges and intent.charges.data:
+                charge = intent.charges.data[0]
+                payment_method = charge.payment_method_details.type if charge.payment_method_details else "unknown"
+
+            payment.stripe_payment_intent_id = payment_intent
+            payment.payment_method = payment_method
+            payment.status = "success"
+            payment.paid_at = now()
+            payment.save()
 
             # Activate subscription
             sub.plan = plan
@@ -1110,16 +1218,23 @@ class StripeWebhookView(APIView):
             else:
                 sub.end_date = sub.start_date + timedelta(days=365)
 
-            sub.stripe_payment_intent_id = payment_intent
+            sub.last_payment = payment
             sub.save()
 
             # Create invoice
             Invoice.objects.create(
                 subscription=sub,
-                amount=plan.price,
+                payment=payment,
+                base_amount=payment.base_amount,
+                discount_amount=payment.discount_amount,
+                gst_amount=payment.gst_amount,
+                total_amount=payment.final_amount,
+                currency=payment.currency,
                 plan_name=plan.name,
-                status="paid",
-                stripe_payment_intent_id=payment_intent
+                plan_interval=plan.interval,
+                stripe_payment_intent_id=payment_intent,
+                status='paid',
+                invoice_number = f"INV-{payment.id}-{int(now().timestamp())}"
             )
 
 # Fallback if Webhook Fails
@@ -1144,12 +1259,13 @@ class VerifyPaymentView(APIView):
         if not session.payment_intent:
             return Response({"error": "Payment intent not found"}, status=400)
 
-        # ✅ FIXED metadata handling
+        # FIXED metadata handling
         metadata = session.metadata if session.metadata else {}
-        print("METADATA:", metadata)
 
-        plan_id = metadata.plan_id if hasattr(metadata, 'plan_id') else metadata.get("plan_id")
-        user_id = metadata.user_id if hasattr(metadata, 'user_id') else metadata.get("user_id")
+        # plan_id = metadata.plan_id if hasattr(metadata, 'plan_id') else metadata.get("plan_id")
+        plan_id = metadata.get("plan_id")
+        # user_id = metadata.user_id if hasattr(metadata, 'user_id') else metadata.get("user_id")
+        user_id = metadata.get("user_id")
 
         if not plan_id or not user_id:
             return Response({"error": "Invalid metadata"}, status=400)
@@ -1175,8 +1291,11 @@ class VerifyPaymentView(APIView):
             if payment.status == "success":
                 return Response({"message": "Subscription already activated for this session"})
 
-            payment.calculate_final_amount()
             payment.stripe_payment_intent_id = session.payment_intent
+            intent = stripe.PaymentIntent.retrieve(session.payment_intent)
+
+            payment.payment_method = intent.payment_method_types[0] if intent.payment_method_types else "unknown"
+            payment.stripe_charge_id = intent.charges.data[0].id if intent.charges.data else None
             payment.status = "success"
             payment.paid_at = now()
             payment.save()

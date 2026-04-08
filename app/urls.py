@@ -6,7 +6,8 @@ from .views import *
 
 router = DefaultRouter()
 router.register('restaurants', RestaurantViewSet, basename='restaurants')
-router.register('plans', SubscriptionPlanViewSet, basename='plans')
+router.register(r'plans', SubscriptionPlanViewSet, basename='plans')
+router.register(r'plan-pricing', PlanPricingViewSet, basename='plan-pricing')
 router.register('admin/users', AdminUserViewSet, basename='admin-users')
 
 urlpatterns = [

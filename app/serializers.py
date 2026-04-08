@@ -228,6 +228,12 @@ class RestaurantSerializer(serializers.ModelSerializer):
         return None
     
 # ========================= # SUBSCRIPTION SERIALIZER # =========================
+CURRENCY_SYMBOLS = {
+    "INR": "₹",
+    "USD": "$",
+    "CAD": "C$"
+}
+
 class InvoiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invoice
@@ -281,13 +287,19 @@ class ChangePlanSerializer(serializers.Serializer):
             raise serializers.ValidationError("Subscription plan does not exist.")
         return value
 
-class SubscriptionPlanSerializer(serializers.ModelSerializer):
+class SubscriptionPlanSerializer(serializers.ModelSerializer):    
+    price = serializers.SerializerMethodField()
+    currency = serializers.SerializerMethodField()
+    currency_symbol = serializers.SerializerMethodField()
+
     class Meta:
         model = SubscriptionPlan
         fields = [
             'id',
             'name',
             'price',
+            'currency',
+            'currency_symbol',
             'interval',
             'features',
             'popular',
@@ -297,13 +309,24 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
-    def validate_price(self, value):
-        if value < 0:
-            raise serializers.ValidationError("Price cannot be negative.")
-        if value > 999999.99:
-            raise serializers.ValidationError("Price exceeds maximum limit.")
-        return value
+    # ============== PRICING HELPER METHODS ==============
+    def _get_pricing(self, obj):
+        return self.context.get("pricing_map", {}).get(obj.id)
+    
+    def get_price(self, obj):
+        pricing = self._get_pricing(obj)
+        return pricing.price if pricing else None
+    
+    def get_currency(self, obj):
+        pricing = self._get_pricing(obj)
+        return pricing.currency if pricing else "USD"
+    
+    def get_currency_symbol(self, obj):
+        pricing = self._get_pricing(obj)
+        currency = pricing.currency if pricing else "USD"
+        return CURRENCY_SYMBOLS.get(currency, "$")
 
+    # =============== Validations ===============
     def validate_interval(self, value):
         if value not in ['monthly', 'yearly']:
             raise serializers.ValidationError("Invalid interval. Must be 'monthly' or 'yearly'.")
@@ -342,6 +365,34 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
             )
 
         return data
+
+class PlanPricingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PlanPricing
+        fields = [
+            'id',
+            'plan',
+            'country',
+            'currency',
+            'price',
+            'stripe_price_id',
+            'is_active',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_country(self, value):
+        if len(value) != 2:
+            raise serializers.ValidationError(
+                "Country must be ISO 2-letter code."
+            )
+        return value.upper()
+
+    def validate_price(self, value):
+        if value < 0:
+            raise serializers.ValidationError("Price cannot be negative.")
+        return value
 
 # ========================= # PAYMENT SERIALIZER # =========================
 class PaymentTransactionSerializer(serializers.ModelSerializer):

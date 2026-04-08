@@ -1,5 +1,6 @@
 import secrets
 from django.core.mail import send_mail
+from django.core.cache import cache
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from django.http import JsonResponse
@@ -205,34 +206,64 @@ def reset_otp_fields(user, full_reset=True):
         user.otp_attempts = 0
         user.otp_blocked_until = None
 
+# ============================= SUBSCRIPTION HELPER FUNCTIONS =============================
+
+def get_client_ip(request):
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+
+    if x_forwarded_for:
+        return x_forwarded_for.split(',')[0]
+
+    return request.META.get('REMOTE_ADDR')
+
+
+def get_country_from_ip(ip):
+    cached = cache.get(f"geo:{ip}")
+    if cached:
+        return cached
+
+    try:
+        response = requests.get(f"https://ipapi.co/{ip}/json/", timeout=2)
+        country = response.json().get("country", "US")
+        cache.set(f"geo:{ip}", country, 86400)
+        return country
+    except:
+        return "US"  # Default fallback
+    
+def get_plan_pricing(plan, country):
+    pricing = plan.pricings.filter(country=country, is_active=True).first()
+    if not pricing:
+        pricing = plan.pricings.filter(country="US", is_active=True).first()
+    return pricing
+
 # ============================= PAYMENT HELPER FUNCTIONS =============================
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-
-def create_checkout_session(user, plan):
+def create_checkout_session(user, plan, pricing):
     """Create Stripe Checkout Session (one-time payment)"""
 
     try:
         session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
+            payment_method_types=['card', 'upi', 'netbanking'],  # support multiple methods
             mode='payment',  # FIXED (manual flow)
 
             customer_email=user.email,
 
             line_items=[{
                 'price_data': {
-                    'currency': 'inr',  # ✅ match your pricing
+                    'currency': pricing.currency.lower(),  # ✅ match your pricing
                     'product_data': {
                         'name': plan.name,
                     },
-                    'unit_amount': int(plan.price * 100),
+                    'unit_amount': int(pricing.price * 100),
                 },
                 'quantity': 1,
             }],
 
             metadata={
-                'user_id': str(user.id),  # ✅ always string
+                'user_id': str(user.id),  # always string
                 'plan_id': str(plan.id),
+                'country': pricing.country,
             },
 
             success_url=f"{settings.FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
