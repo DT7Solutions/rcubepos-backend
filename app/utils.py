@@ -244,7 +244,7 @@ def create_checkout_session(user, plan, pricing):
 
     try:
         session = stripe.checkout.Session.create(
-            payment_method_types=['card', 'upi', 'netbanking'],  # support multiple methods
+            payment_method_types=['card', 'upi'],  # support multiple methods
             mode='payment',  # FIXED (manual flow)
 
             customer_email=user.email,

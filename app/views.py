@@ -1088,14 +1088,20 @@ class CreateCheckoutSessionView(APIView):
             return Response({"error": "You already have an active subscription"}, status=400)
 
         # ================= GET COUNTRY =================
-        ip = get_client_ip(request)
-        country = get_country_from_ip(ip)
+        country = request.data.get("country")
+
+        if not country:
+            ip = get_client_ip(request)
+            country = get_country_from_ip(ip)
+
+        if not country:
+            country = "US"
 
         # ================= GET PRICING =================
         pricing = get_plan_pricing(plan, country)
 
         if not pricing:
-            return Response({"error": "Pricing not available"}, status=400)
+            return Response({"error": "Pricing not available for this country"}, status=400)
 
         # ================= CREATE PAYMENT =================
         payment = PaymentTransaction.objects.create(
@@ -1123,7 +1129,7 @@ class CreateCheckoutSessionView(APIView):
         return Response({
             "url": session.url,
             "session_id": session.id,
-            "country": country,
+            "country": pricing.country,
             "currency": pricing.currency
         })
 
@@ -1262,13 +1268,21 @@ class VerifyPaymentView(APIView):
         # FIXED metadata handling
         metadata = session.metadata if session.metadata else {}
 
+        plan_id = getattr(metadata, "plan_id", None)
+        user_id = getattr(metadata, "user_id", None)
+
         # plan_id = metadata.plan_id if hasattr(metadata, 'plan_id') else metadata.get("plan_id")
-        plan_id = metadata.get("plan_id")
+        # plan_id = metadata.get("plan_id")
+        # plan_id = metadata["plan_id"] if "plan_id" in metadata else None
         # user_id = metadata.user_id if hasattr(metadata, 'user_id') else metadata.get("user_id")
-        user_id = metadata.get("user_id")
+        # user_id = metadata.get("user_id")
+        # user_id = metadata["user_id"] if "user_id" in metadata else None
 
         if not plan_id or not user_id:
             return Response({"error": "Invalid metadata"}, status=400)
+        
+        plan_id = int(plan_id)
+        user_id = int(user_id)
 
         try:
             plan = SubscriptionPlan.objects.get(id=plan_id)
@@ -1295,7 +1309,7 @@ class VerifyPaymentView(APIView):
             intent = stripe.PaymentIntent.retrieve(session.payment_intent)
 
             payment.payment_method = intent.payment_method_types[0] if intent.payment_method_types else "unknown"
-            payment.stripe_charge_id = intent.charges.data[0].id if intent.charges.data else None
+            # payment.stripe_charge_id = intent.charges.data[0].id if intent.charges.data else None
             payment.status = "success"
             payment.paid_at = now()
             payment.save()
