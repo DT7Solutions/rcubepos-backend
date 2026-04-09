@@ -231,7 +231,7 @@ class RestaurantSerializer(serializers.ModelSerializer):
 CURRENCY_SYMBOLS = {
     "INR": "₹",
     "USD": "$",
-    "CAD": "C$"
+    "CAD": "$"
 }
 
 class InvoiceSerializer(serializers.ModelSerializer):
