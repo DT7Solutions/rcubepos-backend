@@ -267,7 +267,7 @@ def create_checkout_session(user, plan, pricing):
             },
 
             success_url=f"{settings.FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{settings.FRONTEND_URL}/subscription/cancelled",
+            cancel_url=f"{settings.FRONTEND_URL}/dashboard",
         )
 
         return session
