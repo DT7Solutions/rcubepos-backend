@@ -66,8 +66,10 @@ class Role(models.Model):
 class Users(AbstractBaseUser, PermissionsMixin):
     first_name = models.CharField(max_length=100, blank=True, null=True)
     last_name = models.CharField(max_length=100, blank=True, null=True)
+    billing_country = models.CharField(max_length=2, blank=True, null=True)
+    phone_country_code = models.CharField(max_length=5, blank=True, null=True)
     phone = models.CharField(
-        max_length=20,
+        max_length=15,
         blank=True,
         null=True,
         # NOTE: unique=True allows multiple NULLs. Use database constraint or validation.

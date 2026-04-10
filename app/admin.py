@@ -4,9 +4,9 @@ from .models import *
 # ================= USERS =================
 @admin.register(Users)
 class UsersAdmin(admin.ModelAdmin):
-    list_display = ('id', 'username', 'email', 'phone', 'role', 'is_staff', 'is_active')
+    list_display = ('id', 'username', 'email', 'phone', 'billing_country', 'role', 'is_staff', 'is_active')
     search_fields = ('username', 'email', 'phone')
-    list_filter = ('role', 'is_staff', 'is_active')
+    list_filter = ('role', 'is_staff', 'is_active', 'billing_country')
     ordering = ('-created_at',)
 
 

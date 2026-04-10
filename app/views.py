@@ -981,22 +981,23 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
 
-        country = request.query_params.get("country")
+        user = request.user
+
+        # ================= COUNTRY LOGIC =================
+        if user.is_authenticated and user.billing_country:
+            country = user.billing_country
+        else:
+            # fallback ONLY from frontend
+            country = request.query_params.get("country")
 
         if not country:
-            ip = get_client_ip(request)
-            country = get_country_from_ip(ip)
+            country = "US"  # final fallback
 
-            print("IP:", ip)
-            print("Country:", country)
-
-        if not country:
-            country = "US"
-
+        # ================= PRICING =================
         pricing_qs = PlanPricing.objects.filter(country=country, is_active=True)
         pricing_map = {p.plan_id: p for p in pricing_qs}
 
-        # fallback
+        # fallback pricing
         missing_ids = set(queryset.values_list('id', flat=True)) - set(pricing_map.keys())
 
         if missing_ids:
@@ -1004,6 +1005,7 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
                 plan_id__in=missing_ids,
                 is_active=True
             ).order_by('price')
+
             for p in fallback_qs:
                 pricing_map[p.plan_id] = p
 
@@ -1017,7 +1019,7 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
             "country": country,
             "plans": serializer.data
         })
-    
+
     # ================= PERMISSIONS =================
     def perform_create(self, serializer):
         if not self.request.user.is_staff:
@@ -1088,17 +1090,10 @@ class CreateCheckoutSessionView(APIView):
             return Response({"error": "You already have an active subscription"}, status=400)
 
         # ================= GET COUNTRY =================
-        country = request.data.get("country")
-
-        if not country:
-            ip = get_client_ip(request)
-            country = get_country_from_ip(ip)
-
-        if not country:
-            country = "US"
+        country = user.billing_country if user.billing_country else "US"
 
         # ================= GET PRICING =================
-        pricing = get_plan_pricing(plan, country)
+        pricing = get_plan_pricing(plan)
 
         if not pricing:
             return Response({"error": "Pricing not available for this country"}, status=400)

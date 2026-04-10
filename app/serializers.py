@@ -30,6 +30,8 @@ class UserSerializer(serializers.ModelSerializer):
 # ========================= # AUTH SERIALIZER # =========================
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
+    phone_country_code = serializers.CharField(required=True)
+    billing_country = serializers.CharField(required=True)
 
     class Meta:
         model = Users
@@ -39,6 +41,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             'username',
             'email',
             'phone',
+            'phone_country_code',
+            'billing_country',
             'password',
         ]
 
@@ -64,9 +68,22 @@ class RegisterSerializer(serializers.ModelSerializer):
         if Users.objects.filter(phone=value).exists():
             raise serializers.ValidationError("Phone number already exists")
         return value
+    
+    def validate_phone_country_code(self, value):
+        if not value.startswith("+"):
+            raise serializers.ValidationError("Country code must start with '+'")
+        return value
+    
+    def validate_billing_country(self, value):
+        if len(value) != 2:
+            raise serializers.ValidationError("Country must be ISO 2-letter code")
+        return value.upper()
 
     def create(self, validated_data):
         password = validated_data.pop('password')
+
+        phone_country_code = validated_data.pop('phone_country_code')
+        billing_country = validated_data.pop('billing_country')
 
         user = Users.objects.create(**validated_data)
 
