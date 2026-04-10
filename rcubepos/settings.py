@@ -29,23 +29,25 @@ SECRET_KEY = 'django-insecure-ia35agc!--gj$1u%w0nfu@!x^i*98%+%g$ut9h_7%in6chwdtd
 DEBUG = False
 
 # ALLOWED_HOSTS = ["*"]
-ALLOWED_HOSTS = ["91.108.110.206", "api.codkraft.com", "www.api.codkraft.com"]
+ALLOWED_HOSTS = ["91.108.110.206", "api.rcubesmart.com", "www.api.rcubesmart.com"]
 
 CSRF_TRUSTED_ORIGINS = [
-    # "http://localhost:8080",
-    "https://rcubepos.codkraft.com",
+    "http://localhost:8080",
+    "https://rcubesmart.com",
+    # "https://rcubepos.codkraft.com",
 
 ]
 
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
-    # "http://localhost:8080",
-    "https://rcubepos.codkraft.com",
+    "http://localhost:8080",
+    "https://rcubesmart.com",
+    # "https://rcubepos.codkraft.com",
 ]
 
 # FRONTEND_URL = "http://localhost:8080"
-FRONTEND_URL = "https://rcubepos.codkraft.com"
-
+# FRONTEND_URL = "https://rcubepos.codkraft.com"
+FRONTEND_URL = "https://rcubesmart.com"
 
 INSTALLED_APPS = [
     'django.contrib.admin',
