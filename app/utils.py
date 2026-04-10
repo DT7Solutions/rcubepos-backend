@@ -215,20 +215,6 @@ def get_client_ip(request):
         return x_forwarded_for.split(',')[0]
 
     return request.META.get('REMOTE_ADDR')
-
-
-def get_country_from_ip(ip):
-    cached = cache.get(f"geo:{ip}")
-    if cached:
-        return cached
-
-    try:
-        response = requests.get(f"https://ipapi.co/{ip}/json/", timeout=2)
-        country = response.json().get("country", "US")
-        cache.set(f"geo:{ip}", country, 86400)
-        return country
-    except:
-        return "US"  # Default fallback
     
 def get_plan_pricing(plan, country):
     pricing = plan.pricings.filter(country=country, is_active=True).first()

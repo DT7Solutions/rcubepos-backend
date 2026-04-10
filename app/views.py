@@ -990,7 +990,7 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
             # fallback ONLY from frontend
             country = request.query_params.get("country")
 
-        if not country:
+        if country not in ["IN", "CA", "US"]:
             country = "US"  # final fallback
 
         # ================= PRICING =================
