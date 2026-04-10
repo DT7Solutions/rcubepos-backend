@@ -25,8 +25,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-ia35agc!--gj$1u%w0nfu@!x^i*98%+%g$ut9h_7%in6chwdtd'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-# DEBUG = False
+# DEBUG = True
+DEBUG = False
 
 # ALLOWED_HOSTS = ["*"]
 ALLOWED_HOSTS = ["91.108.110.206", "api.rcubesmart.com", "www.api.rcubesmart.com"]
