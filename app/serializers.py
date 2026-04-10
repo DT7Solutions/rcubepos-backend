@@ -94,6 +94,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Owner role does not exist. Please create it before registering users.")
         
         user.set_password(password)
+        user.billing_country = billing_country
+        user.phone_country_code = phone_country_code
         user.save()
 
         return user

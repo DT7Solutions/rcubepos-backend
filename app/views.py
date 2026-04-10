@@ -1093,7 +1093,7 @@ class CreateCheckoutSessionView(APIView):
         country = user.billing_country if user.billing_country else "US"
 
         # ================= GET PRICING =================
-        pricing = get_plan_pricing(plan)
+        pricing = get_plan_pricing(plan, country)
 
         if not pricing:
             return Response({"error": "Pricing not available for this country"}, status=400)
