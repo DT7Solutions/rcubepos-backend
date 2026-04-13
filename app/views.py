@@ -27,6 +27,9 @@ from datetime import timedelta, timezone
 # from collections import deafultdict
 import logging
 import stripe
+import requests
+from django.core.cache import cache
+from ipware import get_client_ip
 
 from .models import *
 from .serializers import *
@@ -984,11 +987,33 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         user = request.user
 
         # ================= COUNTRY LOGIC =================
-        if user.is_authenticated and user.billing_country:
+        country = "US" # initial default
+        
+        if user.is_authenticated and hasattr(user, 'billing_country') and user.billing_country:
             country = user.billing_country
         else:
-            # fallback ONLY from frontend
-            country = request.query_params.get("country")
+            ip_data = get_client_ip(request)
+            client_ip = ip_data[0] if isinstance(ip_data, tuple) else ip_data
+            # client_ip = "103.119.165.1"  # A random Indian public IP
+            # client_ip = "170.171.1.0" # A random US public IP
+            # client_ip = "64.59.131.82" # A random Canada public IP
+            
+            if client_ip:
+                cached_country = cache.get(f"ip_country_{client_ip}")
+                if cached_country:
+                    country = cached_country
+                else:
+                    try:
+                        response = requests.get(f"http://ip-api.com/json/{client_ip}?fields=countryCode", timeout=3)
+                        if response.status_code == 200:
+                            data = response.json()
+                            print(data)
+                            if data and data.get("countryCode"):
+                                country = data["countryCode"]
+                                cache.set(f"ip_country_{client_ip}", country, 86400) # 24 hours
+                    except Exception as e:
+                        logger = logging.getLogger(__name__)
+                        logger.error(f"IP Geolocation failed for {client_ip}: {str(e)}")
 
         if country not in ["IN", "CA", "US"]:
             country = "US"  # final fallback
