@@ -988,60 +988,66 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
 
         # ================= COUNTRY LOGIC =================
         country = "US" # initial default
+        debug_trace = {}
         
         if user.is_authenticated and hasattr(user, 'billing_country') and user.billing_country:
             country = user.billing_country
+            debug_trace['msg'] = 'user_authenticated'
         else:
             ip_data = get_client_ip(request)
             client_ip = ip_data[0] if isinstance(ip_data, tuple) else ip_data
-            # client_ip = "103.119.165.1"  # A random Indian public IP
-            # client_ip = "170.171.1.0" # A random US public IP
-            # client_ip = "64.59.131.82" # A random Canada public IP
+            debug_trace['extracted_ip'] = client_ip
             
             if client_ip:
                 cached_country = cache.get(f"ip_country_{client_ip}")
                 if cached_country:
                     country = cached_country
+                    debug_trace['msg'] = 'from_cache'
                 else:
                     try:
                         response = requests.get(f"http://ip-api.com/json/{client_ip}?fields=countryCode", timeout=3)
+                        debug_trace['api_status_code'] = response.status_code
                         if response.status_code == 200:
                             data = response.json()
-                            print(data)
+                            debug_trace['api_response'] = data
                             if data and data.get("countryCode"):
                                 country = data["countryCode"]
                                 cache.set(f"ip_country_{client_ip}", country, 86400) # 24 hours
                     except Exception as e:
                         logger = logging.getLogger(__name__)
                         logger.error(f"IP Geolocation failed for {client_ip}: {str(e)}")
+                        debug_trace['exception'] = str(e)
 
         if country not in ["IN", "CA", "US"]:
             country = "US"  # final fallback
+
+        debug_trace['resolved_country'] = country
 
         # ================= PRICING =================
         pricing_qs = PlanPricing.objects.filter(country=country, is_active=True)
         pricing_map = {p.plan_id: p for p in pricing_qs}
 
-        # fallback pricing
+        # fallback pricing for plans that don't have country-specific pricing
         missing_ids = set(queryset.values_list('id', flat=True)) - set(pricing_map.keys())
 
         if missing_ids:
+            # fetch generic fallback or minimum price available 
             fallback_qs = PlanPricing.objects.filter(
                 plan_id__in=missing_ids,
                 is_active=True
-            ).order_by('price')
+            ).order_by('price') # pick one basically by sorting
 
+            # pick the first one
             for p in fallback_qs:
-                pricing_map[p.plan_id] = p
+                if p.plan_id not in pricing_map:
+                    pricing_map[p.plan_id] = p
 
-        serializer = self.get_serializer(
-            queryset,
-            many=True,
-            context={"pricing_map": pricing_map}
-        )
-
+        serializer = self.get_serializer(queryset, many=True, context={'pricing_map': pricing_map, 'country': country})
+        
+        # We need custom response to return country code
         return Response({
             "country": country,
+            "debug": debug_trace,
             "plans": serializer.data
         })
 
