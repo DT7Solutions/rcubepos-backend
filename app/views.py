@@ -988,40 +988,31 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
 
         # ================= COUNTRY LOGIC =================
         country = "US" # initial default
-        debug_trace = {}
         
         if user.is_authenticated and hasattr(user, 'billing_country') and user.billing_country:
             country = user.billing_country
-            debug_trace['msg'] = 'user_authenticated'
         else:
             ip_data = get_client_ip(request)
             client_ip = ip_data[0] if isinstance(ip_data, tuple) else ip_data
-            debug_trace['extracted_ip'] = client_ip
             
             if client_ip:
                 cached_country = cache.get(f"ip_country_{client_ip}")
                 if cached_country:
                     country = cached_country
-                    debug_trace['msg'] = 'from_cache'
                 else:
                     try:
                         response = requests.get(f"http://ip-api.com/json/{client_ip}?fields=countryCode", timeout=3)
-                        debug_trace['api_status_code'] = response.status_code
                         if response.status_code == 200:
                             data = response.json()
-                            debug_trace['api_response'] = data
                             if data and data.get("countryCode"):
                                 country = data["countryCode"]
                                 cache.set(f"ip_country_{client_ip}", country, 86400) # 24 hours
                     except Exception as e:
                         logger = logging.getLogger(__name__)
                         logger.error(f"IP Geolocation failed for {client_ip}: {str(e)}")
-                        debug_trace['exception'] = str(e)
 
         if country not in ["IN", "CA", "US"]:
             country = "US"  # final fallback
-
-        debug_trace['resolved_country'] = country
 
         # ================= PRICING =================
         pricing_qs = PlanPricing.objects.filter(country=country, is_active=True)
@@ -1044,10 +1035,8 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(queryset, many=True, context={'pricing_map': pricing_map, 'country': country})
         
-        # We need custom response to return country code
         return Response({
             "country": country,
-            "debug": debug_trace,
             "plans": serializer.data
         })
 
