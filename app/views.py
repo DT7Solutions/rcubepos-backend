@@ -1484,10 +1484,7 @@ class InvoiceGenerator:
         currency_mapping = {
             'IN': '₹',
             'US': '$',
-            'CA': 'CA$',
-            'GB': '£',
-            'AU': 'A$',
-            'EU': '€'
+            'CA': '$',
         }
         currency_symbol = currency_mapping.get(billing_country, '$') if billing_country else '$'
         data = [
