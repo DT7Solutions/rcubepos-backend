@@ -219,6 +219,7 @@ class RestaurantSerializer(serializers.ModelSerializer):
 
     plan = serializers.SerializerMethodField()
     expiry_date = serializers.SerializerMethodField()
+    latest_invoice_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Restaurant
@@ -234,6 +235,7 @@ class RestaurantSerializer(serializers.ModelSerializer):
             'status',
             'created_at',
             'expiry_date',
+            'latest_invoice_id',
         ]
 
     def get_plan(self, obj):
@@ -244,6 +246,12 @@ class RestaurantSerializer(serializers.ModelSerializer):
     def get_expiry_date(self, obj):
         if hasattr(obj, 'subscription') and obj.subscription.end_date:
             return obj.subscription.end_date
+        return None
+        
+    def get_latest_invoice_id(self, obj):
+        if hasattr(obj, 'subscription') and obj.subscription:
+            latest_invoice = obj.subscription.invoices.order_by('-created_at').first()
+            return latest_invoice.id if latest_invoice else None
         return None
     
 # ========================= # SUBSCRIPTION SERIALIZER # =========================

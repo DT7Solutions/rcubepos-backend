@@ -18,6 +18,7 @@ python-decouple==3.8
 pytz==2026.1.post1
 PyYAML==6.0.3
 requests==2.33.1
+reportlab==4.2.5
 sqlparse==0.5.5
 stripe==15.0.1
 typing_extensions==4.15.0

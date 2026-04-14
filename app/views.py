@@ -7,9 +7,11 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
+from rest_framework import status
 
 from django.contrib.auth import authenticate
 from django.conf import settings
+from django.http import HttpResponse
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
@@ -29,8 +31,13 @@ import logging
 import stripe
 import requests
 from django.core.cache import cache
+from django.core.exceptions import ObjectDoesNotExist
 from ipware import get_client_ip
-
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
 from .models import *
 from .serializers import *
 from .utils import *
@@ -1401,6 +1408,186 @@ class SelectPlanView(APIView):
             "end_date": sub.end_date
         })
 
+# ========================= # INVOICE VIEWS # ==========================
+logger = logging.getLogger(__name__)
+class InvoiceGenerator:
+    def __init__(self, invoice_id):
+        self.invoice_id = invoice_id
+        self.invoice = None
+
+    def fetch_invoice(self):
+        """
+        Fetch the invoice from the database and handle any missing invoice errors.
+        """
+        try:
+            self.invoice = Invoice.objects.get(id=self.invoice_id)
+        except ObjectDoesNotExist:
+            logger.error(f"Invoice with ID {self.invoice_id} does not exist.")
+            raise ValueError("Invoice not found.")
+        except Exception as e:
+            logger.error(f"Error fetching invoice: {str(e)}", exc_info=True)
+            raise Exception("Error fetching invoice data.")
+
+    def generate_pdf(self):
+        """
+        Generate the PDF for the invoice.
+        """
+        if not self.invoice:
+            raise ValueError("Invoice data is missing. Please fetch the invoice first.")
+
+        response = HttpResponse(content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="invoice_{self.invoice.invoice_number}.pdf"'
+
+        # Set up the document layout
+        doc = SimpleDocTemplate(
+            response, 
+            pagesize=letter, 
+            rightMargin=inch, 
+            leftMargin=inch, 
+            topMargin=inch, 
+            bottomMargin=inch
+        )
+        elements = []
+        styles = getSampleStyleSheet()
+        normal_style = styles['Normal']
+
+        # 1. Header (Company Info & INVOICE title)
+        header_data = [
+            [
+                Paragraph("<b>RCube Smart POS</b><br/>123 Tech Lane<br/>Silicon Valley, CA 94025<br/>support@rcubepad.com", normal_style), 
+                Paragraph(f"<font size=20><b>INVOICE</b></font><br/><b>Date:</b> {self.invoice.date}<br/><b>Invoice #:</b> {self.invoice.invoice_number}<br/><b>Status:</b> {self.invoice.get_status_display()}", normal_style)
+            ]
+        ]
+        header_table = Table(header_data, colWidths=[3.5*inch, 3*inch])
+        header_table.setStyle(TableStyle([
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ]))
+        elements.append(header_table)
+        elements.append(Spacer(1, 40))
+
+        # 2. Bill To Information
+        user = self.invoice.subscription.user
+        restaurant = self.invoice.subscription.restaurant
+        bill_to_text = f"<b>Bill To:</b><br/>{user.first_name or ''} {user.last_name or ''}<br/>{user.email}<br/>"
+        
+        if restaurant:
+            bill_to_text += f"<b>Restaurant:</b> {restaurant.name}<br/>{restaurant.address}<br/>"
+        else:
+            bill_to_text += f"{user.address or ''}<br/>{user.city or ''} {user.state or ''} {user.pincode or ''}<br/>"
+            
+        elements.append(Paragraph(bill_to_text, normal_style))
+        elements.append(Spacer(1, 30))
+
+        # 3. Line Items Table
+        billing_country = getattr(user, 'billing_country', None)
+        currency_mapping = {
+            'IN': '₹',
+            'US': '$',
+            'CA': 'CA$',
+            'GB': '£',
+            'AU': 'A$',
+            'EU': '€'
+        }
+        currency_symbol = currency_mapping.get(billing_country, '$') if billing_country else '$'
+        data = [
+            ["Description", "Interval", "Amount"]
+        ]
+        
+        # Add the main subscription item
+        data.append([
+            f"{self.invoice.plan_name} Subscription",
+            self.invoice.plan_interval.capitalize(),
+            f"{currency_symbol} {self.invoice.base_amount}"
+        ])
+        
+        # Add Billing Details as extra line items (if any)
+        billing_details = self.invoice.billing_details or {}
+        for key, value in billing_details.items():
+            data.append([
+                key.capitalize(),
+                "—",
+                f"{currency_symbol} {value}"
+            ])
+            
+        table = Table(data, colWidths=[4*inch, 1.25*inch, 1.25*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f3f4f6')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#374151')),
+            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+            ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('TOPPADDING', (0, 0), (-1, 0), 12),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e5e7eb')),
+            ('PADDING', (0, 0), (-1, -1), 10),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 20))
+
+        # 4. Summary Table (Subtotal, Discount, GST, Total)
+        summary_data = [
+            ["Subtotal:", f"{currency_symbol} {self.invoice.base_amount}"],
+            ["Discount:", f"- {currency_symbol} {self.invoice.discount_amount}"],
+            ["GST / Taxes:", f"{currency_symbol} {self.invoice.gst_amount}"],
+            ["Total Amount:", f"{currency_symbol} {self.invoice.total_amount}"]
+        ]
+        summary_table = Table(summary_data, colWidths=[5.25*inch, 1.25*inch])
+        summary_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
+            ('LINEBELOW', (0, -1), (-1, -1), 2, colors.black),
+        ]))
+        
+        elements.append(summary_table)
+        elements.append(Spacer(1, 40))
+
+        # 5. Footer
+        footer_text = "<para align=center>Thank you for your business!<br/>If you have any questions regarding this invoice, please contact support.</para>"
+        elements.append(Paragraph(footer_text, normal_style))
+
+        # Build the final document
+        doc.build(elements)
+        return response
+
+    def create_invoice_pdf(self):
+        """
+        Fetch invoice and generate PDF.
+        """
+        try:
+            self.fetch_invoice()
+            return self.generate_pdf()
+        except Exception as e:
+            logger.error(f"Error creating invoice PDF: {str(e)}", exc_info=True)
+            raise Exception(f"Failed to generate invoice PDF: {str(e)}")
+
+class InvoiceGenerationView(APIView):
+    """
+    View to generate an invoice as a PDF.
+    """
+    def get(self, request, invoice_id):
+        try:
+            # Initialize the invoice generator with the provided invoice_id
+            user = request.user
+            invoice_generator = InvoiceGenerator(invoice_id)
+            
+            # Check if user is an admin or the owner of the invoice's subscription
+            invoice = invoice_generator.fetch_invoice()
+
+            # Generate the invoice PDF
+            return invoice_generator.create_invoice_pdf()
+
+        except ValueError as e:
+            # Handle case where invoice is not found
+            return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        
+        except Exception as e:
+            # Handle any other unexpected errors
+            return Response({"error": "An error occurred while generating the invoice", "details": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
 # ========================= # PLATFORM VIEWS # =========================
 class PlatformSettingsView(APIView):
     authentication_classes = [JWTAuthentication]

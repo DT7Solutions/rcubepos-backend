@@ -42,6 +42,7 @@ urlpatterns = [
     path('create-checkout-session/', CreateCheckoutSessionView.as_view()),
     path('verify-payment/', VerifyPaymentView.as_view()),
     path("stripe/webhook/", StripeWebhookView.as_view()),
+    path("invoice/<int:invoice_id>/download/", InvoiceGenerationView.as_view(), name="download_invoice"),
 
     # API
     path('', include(router.urls)),
