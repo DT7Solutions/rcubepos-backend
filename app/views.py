@@ -38,6 +38,8 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
 from .models import *
 from .serializers import *
 from .utils import *
@@ -949,30 +951,36 @@ class MySubscriptionView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        sub = Subscription.objects.filter(user=request.user).first()
+        user = request.user
+        sub = Subscription.objects.filter(user=user)\
+            .select_related('plan', 'restaurant')\
+            .prefetch_related('invoices')\
+            .first()
 
         if not sub:
             return Response({
                 "status": "none",
                 "plan": None,
                 "start_date": None,
-                "end_date": None
+                "end_date": None,
+                "invoices": [],
+                "payments": []
             })
-        
-        status = sub.get_status()
 
-        if status != sub.status:
-            Subscription.objects.filter(id=sub.id).update(status=status)       
+        # Sync status if stale
+        derived_status = sub.get_status()
+        if derived_status != sub.status:
+            Subscription.objects.filter(id=sub.id).update(status=derived_status)
 
-        return Response({
-            "status": status,
-            "plan": {
-                "id": sub.plan.id if sub.plan else None,
-                "name": sub.plan.name if sub.plan else None,
-            },
-            "start_date": sub.start_date,
-            "end_date": sub.end_date,
-        })
+        # Fetch ALL transactions for this user (all statuses)
+        payments = PaymentTransaction.objects.filter(
+            user=user
+        ).order_by("-created_at")
+
+        sub_data = OwnerSubscriptionSerializer(sub).data
+        sub_data["payments"] = PaymentTransactionSerializer(payments, many=True).data
+
+        return Response(sub_data)
 
 class SubscriptionPlanViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.AllowAny]
@@ -1356,6 +1364,7 @@ class VerifyPaymentView(APIView):
                 discount_amount=payment.discount_amount,
                 gst_amount=payment.gst_amount,
                 total_amount=payment.final_amount,
+                currency=payment.currency,
                 plan_name=plan.name,
                 plan_interval=plan.interval,
                 stripe_payment_intent_id=payment.stripe_payment_intent_id,
@@ -1410,6 +1419,7 @@ class SelectPlanView(APIView):
 
 # ========================= # INVOICE VIEWS # ==========================
 logger = logging.getLogger(__name__)
+pdfmetrics.registerFont(TTFont('DejaVuSans', 'static/fonts/DejaVuSans.ttf'))
 class InvoiceGenerator:
     def __init__(self, invoice_id):
         self.invoice_id = invoice_id
@@ -1450,6 +1460,7 @@ class InvoiceGenerator:
         elements = []
         styles = getSampleStyleSheet()
         normal_style = styles['Normal']
+        normal_style.fontName = "DejaVuSans"
 
         # 1. Header (Company Info & INVOICE title)
         header_data = [
@@ -1495,7 +1506,7 @@ class InvoiceGenerator:
         data.append([
             f"{self.invoice.plan_name} Subscription",
             self.invoice.plan_interval.capitalize(),
-            f"{currency_symbol} {self.invoice.base_amount}"
+            Paragraph(f"{currency_symbol} {self.invoice.base_amount}", normal_style)
         ])
         
         # Add Billing Details as extra line items (if any)
@@ -1524,10 +1535,10 @@ class InvoiceGenerator:
 
         # 4. Summary Table (Subtotal, Discount, GST, Total)
         summary_data = [
-            ["Subtotal:", f"{currency_symbol} {self.invoice.base_amount}"],
-            ["Discount:", f"- {currency_symbol} {self.invoice.discount_amount}"],
-            ["GST / Taxes:", f"{currency_symbol} {self.invoice.gst_amount}"],
-            ["Total Amount:", f"{currency_symbol} {self.invoice.total_amount}"]
+            ["Subtotal:", Paragraph(f"{currency_symbol} {self.invoice.base_amount}", normal_style)],
+            ["Discount:", Paragraph(f"- {currency_symbol} {self.invoice.discount_amount}", normal_style)],
+            ["GST / Taxes:", Paragraph(f"{currency_symbol} {self.invoice.gst_amount}", normal_style)],
+            ["Total Amount:", Paragraph(f"{currency_symbol} {self.invoice.total_amount}", normal_style)]
         ]
         summary_table = Table(summary_data, colWidths=[5.25*inch, 1.25*inch])
         summary_table.setStyle(TableStyle([

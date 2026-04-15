@@ -266,12 +266,14 @@ class InvoiceSerializer(serializers.ModelSerializer):
         model = Invoice
         fields = [
             'id',
+            'invoice_number',
             'subscription',
             'date',
             'base_amount',
             'discount_amount',
             'gst_amount',
             'total_amount',
+            'currency',
             'plan_name',
             'plan_interval',
             'status'
@@ -427,6 +429,7 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
         model = PaymentTransaction
         fields = [
             'id',
+            'transaction_id',
             'user',
             'subscription',
             'status',
@@ -439,11 +442,10 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             'currency',
             'stripe_session_id',
             'stripe_payment_intent_id',
-            'stripe_charge_id',
             'created_at',
             'paid_at'
         ]
-        read_only_fields = ['id', 'created_at', 'paid_at']
+        read_only_fields = ['id', 'transaction_id', 'created_at', 'paid_at']
 
 class RefundSerializer(serializers.ModelSerializer):
     class Meta:
