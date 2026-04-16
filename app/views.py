@@ -259,6 +259,34 @@ class LoginView(APIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
 
+            try:
+                ip_address = get_client_ip(request)
+                user_agent = request.META.get('HTTP_USER_AGENT', 'Unknown Device')
+                
+                # Check if this config is already somewhat known
+                is_new_device = not UserSession.objects.filter(
+                    user=user,
+                    ip_address=ip_address
+                ).exists()
+
+                UserSession.objects.create(
+                    user=user,
+                    refresh_token=token_data["refresh_token"],
+                    ip_address=ip_address,
+                    device_info=user_agent[:250]
+                )
+
+                if is_new_device:
+                    try:
+                        send_notification_email(user.email, context="new_login", ip_address=ip_address, device_info=user_agent)
+                    except Exception as e:
+                        logger = logging.getLogger(__name__)
+                        logger.error(f"Failed to send New Login Alert to {user.email}: {str(e)}")
+
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to create UserSession for {user.id}: {str(e)}")
+
             response = Response(
                 {
                     "success": True,
@@ -633,20 +661,123 @@ class ChangePasswordView(APIView):
             data=request.data,
             context={'request': request}
         )
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except ValidationError as e:
+            return Response({"error": e.detail}, status=400)
+        
         serializer.save()
+        
+        try:
+            # Revoke all sessions except potentially the current one, 
+            # or just revoke them all. For security, revoking all EXCEPT current is better,
+            # but getting the current session ID robustly can be tricky if we don't pass it.
+            # However, if we just delete them all, the user will need to log back in.
+            # To keep them logged in, we can delete all sessions EXCEPT the current token's session.
+            current_refresh = request.COOKIES.get("refresh_token")
+            if current_refresh:
+                UserSession.objects.filter(user=request.user).exclude(refresh_token=current_refresh).delete()
+            else:
+                UserSession.objects.filter(user=request.user).delete()
+        except Exception:
+            pass
 
-        return Response({"message": "Password updated successfully"})
+        return Response({"message": "Password updated successfully"}, status=200)
     
+from django.core.signing import dumps, loads, SignatureExpired, BadSignature
+
 class ForgotPasswordView(APIView):
     permission_classes = [permissions.AllowAny]
 
     @swagger_auto_schema(request_body=ForgotPasswordSerializer)
     def post(self, request):
         email = request.data.get("email")
+        if not email:
+            return Response({"error": "Email is required"}, status=400)
+            
+        try:
+            user = Users.objects.get(email=email)
+            
+            # Use Django's signed string for the reset token, valid for some time
+            token = dumps({"user_id": user.id}, salt="forgot-password")
+            reset_url = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+            
+            # Send Email
+            try:
+                send_otp_email(user.email, reset_url, context="forgot_password")
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to send forgot password email to {user.email}: {str(e)}", exc_info=True)
+                
+        except Users.DoesNotExist:
+            pass # Silently fail to prevent user enumeration
+            
         return Response({
-            "message": f"Password reset link sent to {email}"
+            "message": f"If an account exists, a password reset link has been sent to {email}"
         })
+
+class ResetPasswordView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        token = request.data.get("token")
+        password = request.data.get("password")
+        
+        if not token or not password:
+            return Response({"error": "Token and password are required"}, status=400)
+            
+        try:
+            data = loads(token, salt="forgot-password", max_age=3600) # 1 hour expiry
+            user_id = data.get("user_id")
+            user = Users.objects.get(id=user_id)
+            
+            # Reset password
+            user.set_password(password)
+            user.save()
+            
+            # Revoke all existing sessions
+            UserSession.objects.filter(user=user).delete()
+            
+            # Send success notification
+            try:
+                send_notification_email(user.email, context="password_reset_success")
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to send password reset success email: {str(e)}")
+                
+            return Response({"message": "Password reset successfully"}, status=200)
+            
+        except SignatureExpired:
+            return Response({"error": "Reset link has expired"}, status=400)
+        except (BadSignature, Users.DoesNotExist):
+            return Response({"error": "Invalid reset link"}, status=400)
+
+class ActiveSessionsView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        sessions = UserSession.objects.filter(user=request.user).order_by('-last_active')
+        data = [{
+            "id": s.id,
+            "ip_address": s.ip_address,
+            "device_info": s.device_info,
+            "last_active": s.last_active,
+            "created_at": s.created_at,
+            "is_current": s.refresh_token == request.COOKIES.get("refresh_token")
+        } for s in sessions]
+        
+        return Response(data, status=200)
+        
+    def delete(self, request):
+        session_id = request.data.get("session_id")
+        if not session_id:
+            return Response({"error": "Session ID required"}, status=400)
+            
+        deleted, _ = UserSession.objects.filter(id=session_id, user=request.user).delete()
+        if deleted:
+            return Response({"message": "Session revoked"}, status=200)
+        return Response({"error": "Session not found"}, status=404)
     
 # ========================= # ADMIN VIEWS # =========================
 class AdminUserViewSet(viewsets.ModelViewSet):

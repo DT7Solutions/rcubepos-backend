@@ -51,6 +51,7 @@ def build_otp_email_template(otp, context="default"):
     subject_map = {
         "register": "Verify Your Email - RCube POS",
         "change_password": "Reset Your Password - RCube POS",
+        "forgot_password": "Reset Your Password - RCube POS",
         "change_email_old": "Confirm Your Current Email - RCube POS",
         "change_email_new": "Confirm Your New Email - RCube POS",
     }
@@ -58,49 +59,74 @@ def build_otp_email_template(otp, context="default"):
     subject = subject_map.get(context, "Your OTP Code - RCube POS")
 
     # Plain text fallback
-    text_content = f"Your OTP is {otp}. It is valid for 10 minutes."
-
-    # HTML Template
-    html_content = f"""
-    <html>
-    <body style="margin:0;padding:0;font-family:Arial,sans-serif;background-color:#f4f4f4;">
-        <div style="max-width:600px;margin:30px auto;background:#ffffff;border-radius:8px;overflow:hidden;">
-            
-            <div style="background:#0f172a;color:#ffffff;padding:20px;text-align:center;">
-                <h2 style="margin:0;">RCube POS</h2>
+    if context == "forgot_password":
+        text_content = f"Please click the following link to reset your password: {otp}"
+        html_content = f"""
+        <html>
+        <body style="margin:0;padding:0;font-family:Arial,sans-serif;background-color:#f4f4f4;">
+            <div style="max-width:600px;margin:30px auto;background:#ffffff;border-radius:8px;overflow:hidden;">
+                <div style="background:#0f172a;color:#ffffff;padding:20px;text-align:center;">
+                    <h2 style="margin:0;">RCube POS</h2>
+                </div>
+                <div style="padding:30px;text-align:center;">
+                    <h3 style="margin-bottom:10px;">Reset Your Password</h3>
+                    <p style="color:#555;margin-bottom:20px;">Use the button below to reset your password</p>
+                    <a href="{otp}" style="background-color:#0f172a;color:#ffffff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;display:inline-block;">Reset Password</a>
+                    <p style="color:#777;font-size:14px;margin-top:20px;">
+                        This link is valid for a limited time.
+                    </p>
+                    <p style="color:#999;font-size:12px;margin-top:30px;">
+                        If you didn’t request this, you can safely ignore this email.
+                    </p>
+                </div>
             </div>
+        </body>
+        </html>
+        """
+    else:
+        text_content = f"Your OTP is {otp}. It is valid for 10 minutes."
 
-            <div style="padding:30px;text-align:center;">
-                <h3 style="margin-bottom:10px;">Your Verification Code</h3>
-                <p style="color:#555;">Use the OTP below to proceed</p>
-
-                <div style="
-                    font-size:28px;
-                    font-weight:bold;
-                    letter-spacing:8px;
-                    margin:20px 0;
-                    color:#0f172a;
-                ">
-                    {otp}
+        # HTML Template
+        html_content = f"""
+        <html>
+        <body style="margin:0;padding:0;font-family:Arial,sans-serif;background-color:#f4f4f4;">
+            <div style="max-width:600px;margin:30px auto;background:#ffffff;border-radius:8px;overflow:hidden;">
+                
+                <div style="background:#0f172a;color:#ffffff;padding:20px;text-align:center;">
+                    <h2 style="margin:0;">RCube POS</h2>
                 </div>
 
-                <p style="color:#777;font-size:14px;">
-                    This OTP is valid for <strong>10 minutes</strong>.
-                </p>
+                <div style="padding:30px;text-align:center;">
+                    <h3 style="margin-bottom:10px;">Your Verification Code</h3>
+                    <p style="color:#555;">Use the OTP below to proceed</p>
 
-                <p style="color:#999;font-size:12px;margin-top:30px;">
-                    If you didn’t request this, you can safely ignore this email.
-                </p>
+                    <div style="
+                        font-size:28px;
+                        font-weight:bold;
+                        letter-spacing:8px;
+                        margin:20px 0;
+                        color:#0f172a;
+                    ">
+                        {otp}
+                    </div>
+
+                    <p style="color:#777;font-size:14px;">
+                        This OTP is valid for <strong>10 minutes</strong>.
+                    </p>
+
+                    <p style="color:#999;font-size:12px;margin-top:30px;">
+                        If you didn’t request this, you can safely ignore this email.
+                    </p>
+                </div>
+
+                <div style="background:#f1f5f9;padding:15px;text-align:center;font-size:12px;color:#666;">
+                    © {settings.DEFAULT_FROM_EMAIL}
+                </div>
+
             </div>
-
-            <div style="background:#f1f5f9;padding:15px;text-align:center;font-size:12px;color:#666;">
-                © {settings.DEFAULT_FROM_EMAIL}
-            </div>
-
-        </div>
-    </body>
-    </html>
-    """
+        </body>
+        </html>
+        """
 
     return subject, text_content, html_content
 
@@ -108,6 +134,59 @@ def build_otp_email_template(otp, context="default"):
 def send_otp_email(user_email, otp_code, context="default"):
     subject, text_content, html_content = build_otp_email_template(otp_code, context)
 
+    send_email(
+        subject=subject,
+        to_email=user_email,
+        text_content=text_content,
+        html_content=html_content,
+    )
+
+# ----------------------------- NOTIFICATION EMAIL SENDER -----------------------------
+def build_notification_email_template(context, **kwargs):
+    if context == "new_login":
+        subject = "New Login Alert - RCube POS"
+        ip = kwargs.get("ip_address", "Unknown IP")
+        device = kwargs.get("device_info", "Unknown Device")
+        text_content = f"We noticed a new login to your RCube POS account from {device} ({ip}). If this was not you, please change your password immediately."
+        html_content = f"""
+        <html>
+        <body style="font-family:Arial,sans-serif;background-color:#f4f4f4;padding:20px;">
+            <div style="max-width:600px;margin:0 auto;background:#fff;padding:20px;border-radius:8px;">
+                <h3 style="color:#d9534f;">New Login Alert</h3>
+                <p>We noticed a new login to your account.</p>
+                <ul>
+                    <li><strong>Device:</strong> {device}</li>
+                    <li><strong>IP Address:</strong> {ip}</li>
+                </ul>
+                <p>If this was you, you can safely ignore this email.</p>
+                <p>If this was not you, please log in and change your password immediately.</p>
+            </div>
+        </body>
+        </html>
+        """
+    elif context == "password_reset_success":
+        subject = "Password Reset Successful - RCube POS"
+        text_content = "Your RCube POS password has been successfully reset. If you did not perform this action, contact support immediately."
+        html_content = f"""
+        <html>
+        <body style="font-family:Arial,sans-serif;background-color:#f4f4f4;padding:20px;">
+            <div style="max-width:600px;margin:0 auto;background:#fff;padding:20px;border-radius:8px;">
+                <h3 style="color:#5cb85c;">Password Reset Successful</h3>
+                <p>Your password has been successfully updated.</p>
+                <p>If you did not perform this action, please contact support immediately.</p>
+            </div>
+        </body>
+        </html>
+        """
+    else:
+        subject = "Notification - RCube POS"
+        text_content = "You have a new notification."
+        html_content = ""
+
+    return subject, text_content, html_content
+
+def send_notification_email(user_email, context, **kwargs):
+    subject, text_content, html_content = build_notification_email_template(context, **kwargs)
     send_email(
         subject=subject,
         to_email=user_email,

@@ -229,6 +229,7 @@ OTP_COOLDOWN_SECONDS = config('OTP_COOLDOWN_SECONDS', default=60, cast=int)
 # OTP Context Types
 OTP_CONTEXT_REGISTER = 'register'
 OTP_CONTEXT_CHANGE_PASSWORD = 'change_password'
+OTP_CONTEXT_FORGOT_PASSWORD = 'forgot_password'
 OTP_CONTEXT_CHANGE_EMAIL_OLD = 'change_email_old'
 OTP_CONTEXT_CHANGE_EMAIL_NEW = 'change_email_new'
 

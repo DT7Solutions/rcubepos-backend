@@ -21,6 +21,15 @@ class UserRoleAdmin(admin.ModelAdmin):
     list_display = ('user', 'role', 'created_by', 'created_at')
 
 
+# ================= SESSIONS =================
+@admin.register(UserSession)
+class UserSessionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'ip_address', 'device_info', 'last_active', 'created_at')
+    search_fields = ('user__username', 'ip_address', 'device_info')
+    list_filter = ('last_active',)
+    ordering = ('-last_active',)
+
+
 # ================= RESTAURANT =================
 @admin.register(Restaurant)
 class RestaurantAdmin(admin.ModelAdmin):

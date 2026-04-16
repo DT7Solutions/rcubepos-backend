@@ -172,6 +172,27 @@ class UserRole(models.Model):
 
 User = settings.AUTH_USER_MODEL
 
+# ========================= # SESSION MODELS # =========================
+
+class UserSession(models.Model):
+    user = models.ForeignKey(Users, on_delete=models.CASCADE, related_name="active_sessions")
+    refresh_token = models.CharField(max_length=500, unique=True, null=True, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    device_info = models.CharField(max_length=255, null=True, blank=True)
+    browser_info = models.CharField(max_length=255, null=True, blank=True)
+    os_info = models.CharField(max_length=255, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_active = models.DateTimeField(auto_now=True)
+
+    history = HistoricalRecords()
+
+    def __str__(self):
+        return f"{self.user.username} - {self.ip_address} - {self.device_info}"
+
+    class Meta:
+        db_table = 'user_sessions'
+
 # ========================= # RESTAURANT MODELS # =========================
 
 class Restaurant(models.Model):

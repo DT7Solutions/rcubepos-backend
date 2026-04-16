@@ -27,6 +27,8 @@ urlpatterns = [
     path('auth/refresh/', RefreshTokenView.as_view()),
     path('auth/change-password/', ChangePasswordView.as_view()),
     path('auth/forgot-password/', ForgotPasswordView.as_view()),
+    path('auth/reset-password/', ResetPasswordView.as_view()),
+    path('auth/sessions/', ActiveSessionsView.as_view()),
     path('auth/check-availability/', CheckAvailabilityView.as_view()),
 
     # DASHBOARD FLOW

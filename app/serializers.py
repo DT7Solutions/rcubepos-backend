@@ -135,21 +135,25 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
 
 class ChangePasswordSerializer(serializers.Serializer):
     current = serializers.CharField()
-    new_password = serializers.CharField(min_length=8)
+    new_password = serializers.CharField(min_length=8, required=True)
+    confirm_password = serializers.CharField(min_length=8, required=True)
 
     def validate_new_password(self, value):
         """Validate new password strength."""
         try:
             validate_password(value)
         except DjangoValidationError as e:
-            raise serializers.ValidationError(e.messages)
+            raise serializers.ValidationError("New password is too weak: " + ', '.join(e.messages))
         return value
 
     def validate(self, data):
         user = self.context['request'].user
 
         if not user.check_password(data['current']):
-            raise serializers.ValidationError("Current password is incorrect")
+            raise serializers.ValidationError("The current password you entered is incorrect.")
+        
+        if data['new_password'] != data['confirm_password']:
+            raise serializers.ValidationError("The new password and confirmation password do not match.")
 
         return data
 
