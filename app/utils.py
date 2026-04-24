@@ -309,7 +309,7 @@ def create_checkout_session(user, plan, pricing):
 
     try:
         session = stripe.checkout.Session.create(
-            payment_method_types=['card', 'upi'],  # support multiple methods
+            payment_method_types=['card'],  # support multiple methods
             mode='payment',  # FIXED (manual flow)
 
             customer_email=user.email,
@@ -343,3 +343,70 @@ def create_checkout_session(user, plan, pricing):
 
     except Exception as e:
         raise Exception(f"Checkout Session Error: {str(e)}")
+
+def process_successful_payment(payment, plan, payment_intent_id, payment_method):
+    """
+    Robust centralized method to activate subscriptions and create invoices
+    after a successful Stripe payment.
+    MUST be called within `transaction.atomic()`.
+    """
+    import logging
+    from django.utils.timezone import now
+    from datetime import timedelta
+    from .models import Invoice
+
+    logger = logging.getLogger(__name__)
+
+    # Idempotency check securely
+    if payment.status == "success":
+        logger.info(f"PaymentTransaction {payment.id} already processed. Skipping.")
+        return True, "Payment already successfully processed."
+
+    # Finalize PaymentTransaction record
+    payment.stripe_payment_intent_id = payment_intent_id
+    payment.payment_method = payment_method
+    payment.status = "success"
+    payment.paid_at = now()
+    payment.save()
+
+    sub = payment.subscription
+
+    # Activate Subscription
+    sub.plan = plan
+    sub.status = "active"
+    sub.start_date = now().date()
+
+    if plan.interval == "monthly":
+        sub.end_date = sub.start_date + timedelta(days=30)
+    else:
+        # Defaults to yearly
+        sub.end_date = sub.start_date + timedelta(days=365)
+
+    sub.last_payment = payment
+    sub.save()
+
+    # Create Invoice safely
+    try:
+        Invoice.objects.get_or_create(
+            payment=payment,
+            defaults={
+                'subscription': sub,
+                'base_amount': payment.base_amount,
+                'discount_amount': payment.discount_amount,
+                'gst_amount': payment.gst_amount,
+                'total_amount': payment.final_amount,
+                'currency': payment.currency,
+                'plan_name': plan.name,
+                'plan_interval': plan.interval,
+                'stripe_payment_intent_id': payment_intent_id,
+                'status': 'paid',
+                'invoice_number': f"INV-{payment.id}-{int(now().timestamp())}"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Invoice creation failed for Payment {payment.id}: {str(e)}", exc_info=True)
+        # Even if Invoice creation fails, the core subscription continues processing
+        # Though `atomic()` handles rollback if we let the exception bubble up.
+        raise Exception(f"Invoice creation failed: {str(e)}")
+
+    return True, "Subscription activated successfully"

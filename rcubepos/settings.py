@@ -31,16 +31,16 @@ DEBUG = False
 # ALLOWED_HOSTS = ["*"]
 ALLOWED_HOSTS = ["91.108.110.206", "api.rcubesmart.com", "www.api.rcubesmart.com"]
 
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:8080",
-    "https://rcubesmart.com",
-    # "https://rcubepos.codkraft.com",
+# CSRF_TRUSTED_ORIGINS = [
+#     "http://localhost:8080",
+#     "https://rcubesmart.com",
+#     # "https://rcubepos.codkraft.com",
 
-]
+# ]
 
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:8080",
+    # "http://localhost:8080",
     "https://rcubesmart.com",
     # "https://rcubepos.codkraft.com",
 ]
@@ -75,7 +75,7 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
+    # 'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',

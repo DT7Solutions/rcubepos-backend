@@ -140,7 +140,8 @@ class RegisterView(APIView):
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
+        
+@method_decorator(csrf_exempt, name='dispatch')
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -1294,10 +1295,11 @@ class CreateCheckoutSessionView(APIView):
             "currency": pricing.currency
         })
 
-# Implement Webhook Later
+# ========================= # STRIPE WEBHOOK & VERIFY =========================
+
 @method_decorator(csrf_exempt, name='dispatch')
 class StripeWebhookView(APIView):
-    permission_classes = [AllowAny]  # AllowAny (no auth)
+    permission_classes = [AllowAny]
 
     def post(self, request):
         payload = request.body
@@ -1310,14 +1312,18 @@ class StripeWebhookView(APIView):
                 settings.STRIPE_WEBHOOK_SECRET
             )
         except stripe.error.SignatureVerificationError:
+            logger.error("Stripe Webhook Signature Verification Failed.")
             return JsonResponse({"error": "Invalid signature"}, status=400)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Stripe Webhook Payload Error: {str(e)}")
             return JsonResponse({"error": "Invalid payload"}, status=400)
 
         event_id = event.id
 
-        # Idempotency check
-        if StripeWebhookLog.objects.filter(event_id=event_id).exists():
+        # Idempotency check - if already PROCESSED, ignore.
+        # If it failed previously (processed=False), allow Stripe to retry.
+        existing_log = StripeWebhookLog.objects.filter(event_id=event_id).first()
+        if existing_log and existing_log.processed:
             return JsonResponse({"status": "already processed"}, status=200)
 
         event_type = event.type
@@ -1326,151 +1332,109 @@ class StripeWebhookView(APIView):
         try:
             if event_type == "checkout.session.completed":
                 self.handle_successful_payment(data)
-
             elif event_type == "checkout.session.expired":
                 self.handle_expired_session(data)
-
             elif event_type == "payment_intent.payment_failed":
                 self.handle_failed_payment(data)
-
             elif event_type == "payment_intent.canceled":
                 self.handle_cancelled_payment(data)
-
             elif event_type == "charge.refunded":
                 self.handle_refund(data)
-
             elif event_type == "checkout.session.async_payment_succeeded":
                 self.handle_successful_payment(data)
-            
             elif event_type == "checkout.session.async_payment_failed":
                 self.handle_expired_session(data)
 
             # Log success
-            StripeWebhookLog.objects.create(
-                event_id=event_id,
-                event_type=event_type,
-                payload=event.to_dict(),
-                processed=True
-            )
+            if existing_log:
+                existing_log.processed = True
+                existing_log.processing_error = None
+                existing_log.save()
+            else:
+                StripeWebhookLog.objects.create(
+                    event_id=event_id,
+                    event_type=event_type,
+                    payload=event.to_dict(),
+                    processed=True
+                )
 
         except Exception as e:
-            StripeWebhookLog.objects.create(
-                event_id=event_id,
-                event_type=event_type,
-                payload=event.to_dict(),
-                processed=False,
-                processing_error=str(e)
-            )
+            logger.error(f"Failed to process webhook event {event_id}: {str(e)}", exc_info=True)
+            if existing_log:
+                existing_log.processing_error = str(e)
+                existing_log.save()
+            else:
+                StripeWebhookLog.objects.create(
+                    event_id=event_id,
+                    event_type=event_type,
+                    payload=event.to_dict(),
+                    processed=False,
+                    processing_error=str(e)
+                )
+            # Return 500 so Stripe knows to retry
             return JsonResponse({"error": "Webhook processing failed"}, status=500)
 
         return JsonResponse({"status": "success"})
 
-    # Combined logic
     def handle_successful_payment(self, session):
         if session.payment_status != "paid":
+            logger.info(f"Webhook checkout.session.completed called but status is {session.payment_status}. Skipping.")
             return
 
         session_id = session.id
         payment_intent = session.payment_intent
 
         metadata = getattr(session, "metadata", {}) or {}
-
         plan_id = metadata.get("plan_id") if isinstance(metadata, dict) else getattr(metadata, "plan_id", None)
         user_id = metadata.get("user_id") if isinstance(metadata, dict) else getattr(metadata, "user_id", None)
 
         if not session_id or not payment_intent:
+            logger.warning("Handle successful payment missing session_id or payment_intent.")
             return
 
         try:
             plan = SubscriptionPlan.objects.get(id=plan_id)
         except SubscriptionPlan.DoesNotExist:
+            logger.error(f"Plan ID {plan_id} not found during successful payment processing.")
             return
 
         with transaction.atomic():
-            try:
-                payment = PaymentTransaction.objects.select_for_update().get(stripe_session_id=session_id)
-            except PaymentTransaction.DoesNotExist:
+            # CAITICAL ISSUE FORMAT FIX: Use filter().first() instead of get().first() to avoid race conditions
+            payment = PaymentTransaction.objects.select_for_update().filter(stripe_session_id=session_id).first()
+            if not payment:
+                logger.error(f"PaymentTransaction for session_id {session_id} not found!")
                 return
 
             sub = payment.subscription
 
-            # Idempotency
-            if payment.status == "success":
-                return
-
             # Safety check
             if str(user_id) != str(sub.user_id):
-                return
-            
-            # Update Payment
-            try:
-                intent = stripe.PaymentIntent.retrieve(payment_intent)
-            except Exception:
+                logger.error(f"User mismatch in successful payment! Expected: {sub.user_id}, Provided in Session: {user_id}")
                 return
 
             payment_method = "unknown"
-
             try:
+                intent = stripe.PaymentIntent.retrieve(payment_intent)
                 charge_id = getattr(intent, "latest_charge", None)
-
                 if charge_id:
                     charge = stripe.Charge.retrieve(charge_id)
-
                     payment_method_details = getattr(charge, "payment_method_details", None)
-
                     if payment_method_details:
                         payment_method = getattr(payment_method_details, "type", "unknown")
-
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Could not retrieve Stripe PaymentIntent details entirely: {str(e)}")
             
-            payment.stripe_payment_intent_id = payment_intent
-            payment.payment_method = payment_method
-            payment.status = "success"
-            payment.paid_at = now()
-            payment.save()
+            process_successful_payment(payment, plan, payment_intent, payment_method)
 
-            # Activate subscription
-            sub.plan = plan
-            sub.status = "active"
-            sub.start_date = now().date()
-
-            if plan.interval == "monthly":
-                sub.end_date = sub.start_date + timedelta(days=30)
-            else:
-                sub.end_date = sub.start_date + timedelta(days=365)
-
-            sub.last_payment = payment
-            sub.save()
-
-            # Create invoice
-            Invoice.objects.create(
-                subscription=sub,
-                payment=payment,
-                base_amount=payment.base_amount,
-                discount_amount=payment.discount_amount,
-                gst_amount=payment.gst_amount,
-                total_amount=payment.final_amount,
-                currency=payment.currency,
-                plan_name=plan.name,
-                plan_interval=plan.interval,
-                stripe_payment_intent_id=payment_intent,
-                status='paid',
-                invoice_number = f"INV-{payment.id}-{int(now().timestamp())}"
-            )
 
     def handle_expired_session(self, session):
         session_id = session.id
-
         if not session_id:
             return
 
         with transaction.atomic():
-            try:
-                payment = PaymentTransaction.objects.select_for_update().get(
-                    stripe_session_id=session_id
-                )
-            except PaymentTransaction.DoesNotExist:
+            payment = PaymentTransaction.objects.select_for_update().filter(stripe_session_id=session_id).first()
+            if not payment:
                 return
 
             if payment.status == "success":
@@ -1480,21 +1444,15 @@ class StripeWebhookView(APIView):
             payment.failure_reason = "Session expired"
             payment.save()
 
+
     def handle_failed_payment(self, intent):
         payment_intent_id = intent.id
-
         if not payment_intent_id:
             return
 
         with transaction.atomic():
-            try:
-                payment = PaymentTransaction.objects.select_for_update().get(
-                    stripe_payment_intent_id=payment_intent_id
-                ).first()
-
-                if not payment:
-                    return
-            except PaymentTransaction.DoesNotExist:
+            payment = PaymentTransaction.objects.select_for_update().filter(stripe_payment_intent_id=payment_intent_id).first()
+            if not payment:
                 return
 
             if payment.status == "success":
@@ -1510,18 +1468,15 @@ class StripeWebhookView(APIView):
             payment.failure_reason = failure_reason
             payment.save()
 
+
     def handle_cancelled_payment(self, intent):
         payment_intent_id = intent.id
-
         if not payment_intent_id:
             return
 
         with transaction.atomic():
-            try:
-                payment = PaymentTransaction.objects.select_for_update().get(
-                    stripe_payment_intent_id=payment_intent_id
-                )
-            except PaymentTransaction.DoesNotExist:
+            payment = PaymentTransaction.objects.select_for_update().filter(stripe_payment_intent_id=payment_intent_id).first()
+            if not payment:
                 return
 
             if payment.status == "success":
@@ -1531,38 +1486,37 @@ class StripeWebhookView(APIView):
             payment.failure_reason = "Payment cancelled"
             payment.save()
 
+
     def handle_refund(self, charge):
         payment_intent_id = charge.payment_intent
-
         if not payment_intent_id:
             return
 
         with transaction.atomic():
-            try:
-                payment = PaymentTransaction.objects.select_for_update().get(
-                    stripe_payment_intent_id=payment_intent_id
-                )
-            except PaymentTransaction.DoesNotExist:
+            payment = PaymentTransaction.objects.select_for_update().filter(stripe_payment_intent_id=payment_intent_id).first()
+            if not payment:
                 return
 
             payment.status = "refunded"
             payment.refunded_amount = (charge.amount_refunded or 0) / 100
             payment.save()
 
-# Fallback if Webhook Fails
+
+# ---------------------- VERIFY PAYMENT ENDPOINT ---------------------- #
 @method_decorator(csrf_exempt, name='dispatch')
 class VerifyPaymentView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
         session_id = request.data.get("session_id")
-
         if not session_id:
             return Response({"error": "session_id required"}, status=400)
 
+        # 1. Fetch Session from Stripe
         try:
             session = stripe.checkout.Session.retrieve(session_id)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to fetch session {session_id} from Stripe: {str(e)}")
             return Response({"error": "Invalid session"}, status=400)
 
         if session.payment_status != "paid":
@@ -1571,84 +1525,46 @@ class VerifyPaymentView(APIView):
         if not session.payment_intent:
             return Response({"error": "Payment intent not found"}, status=400)
 
-        # FIXED metadata handling
+        # 2. Extract Metadata
         metadata = session.metadata if session.metadata else {}
-
-        plan_id = getattr(metadata, "plan_id", None)
-        user_id = getattr(metadata, "user_id", None)
-
-        # plan_id = metadata.plan_id if hasattr(metadata, 'plan_id') else metadata.get("plan_id")
-        # plan_id = metadata.get("plan_id")
-        # plan_id = metadata["plan_id"] if "plan_id" in metadata else None
-        # user_id = metadata.user_id if hasattr(metadata, 'user_id') else metadata.get("user_id")
-        # user_id = metadata.get("user_id")
-        # user_id = metadata["user_id"] if "user_id" in metadata else None
+        plan_id = getattr(metadata, "plan_id", None) or metadata.get("plan_id")
+        user_id = getattr(metadata, "user_id", None) or metadata.get("user_id")
 
         if not plan_id or not user_id:
-            return Response({"error": "Invalid metadata"}, status=400)
-        
-        plan_id = int(plan_id)
-        user_id = int(user_id)
+            return Response({"error": "Invalid metadata inside session"}, status=400)
 
         try:
-            plan = SubscriptionPlan.objects.get(id=plan_id)
+            plan = SubscriptionPlan.objects.get(id=int(plan_id))
         except SubscriptionPlan.DoesNotExist:
             return Response({"error": "Plan not found"}, status=400)
 
+        # 3. Apply shared Idempotent Activation Logic
         with transaction.atomic():
-            try:
-                payment = PaymentTransaction.objects.select_for_update().get(stripe_session_id=session_id)
-            except PaymentTransaction.DoesNotExist:
+            payment = PaymentTransaction.objects.select_for_update().filter(stripe_session_id=session_id).first()
+            if not payment:
                 return Response({"error": "Payment transaction not found"}, status=404)
-            
+
             sub = payment.subscription
 
-            # FIXED ownership check
             if str(user_id) != str(sub.user_id):
                 return Response({"error": "Unauthorized! Session user mismatch"}, status=403)
 
-            # Idempotency
-            if payment.status == "success":
-                return Response({"message": "Subscription already activated for this session"})
-
-            payment.stripe_payment_intent_id = session.payment_intent
-            intent = stripe.PaymentIntent.retrieve(session.payment_intent)
-
-            payment.payment_method = intent.payment_method_types[0] if intent.payment_method_types else "unknown"
-            # payment.stripe_charge_id = intent.charges.data[0].id if intent.charges.data else None
-            payment.status = "success"
-            payment.paid_at = now()
-            payment.save()
-            
-            # Activate subscription
-            sub.plan = plan
-            sub.status = "active"
-            sub.start_date = now().date()
-
-            if plan.interval == "monthly":
-                sub.end_date = sub.start_date + timedelta(days=30)
+            # Idempotency safety
+            if payment.status != "success":
+                # Ensure we sync standard data on manual verification
+                payment_method = "unknown"
+                try:
+                    intent = stripe.PaymentIntent.retrieve(session.payment_intent)
+                    if intent.payment_method_types:
+                        payment_method = intent.payment_method_types[0]
+                except Exception:
+                    pass
+                
+                process_successful_payment(payment, plan, session.payment_intent, payment_method)
             else:
-                sub.end_date = sub.start_date + timedelta(days=365)
+                logger.info(f"VerifyPaymentView invoked but {session_id} was already activated by Webhook.")
 
-            sub.last_payment = payment
-            sub.save()
-
-            Invoice.objects.create(
-                subscription=sub,
-                payment=payment,
-                base_amount=payment.base_amount,
-                discount_amount=payment.discount_amount,
-                gst_amount=payment.gst_amount,
-                total_amount=payment.final_amount,
-                currency=payment.currency,
-                plan_name=plan.name,
-                plan_interval=plan.interval,
-                stripe_payment_intent_id=payment.stripe_payment_intent_id,
-                status='paid',
-                invoice_number = f"INV-{payment.id}-{int(now().timestamp())}"
-            )
-
-        return Response({"message": "Subscription activated successfully"})
+        return Response({"message": "Subscription fully activated and verified."})
 
 # ========================= # INVOICE VIEWS # ==========================
 logger = logging.getLogger(__name__)
