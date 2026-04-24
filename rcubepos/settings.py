@@ -40,7 +40,7 @@ ALLOWED_HOSTS = ["91.108.110.206", "api.rcubesmart.com", "www.api.rcubesmart.com
 
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
-    # "http://localhost:8080",
+    "http://localhost:8080",
     "https://rcubesmart.com",
     # "https://rcubepos.codkraft.com",
 ]
