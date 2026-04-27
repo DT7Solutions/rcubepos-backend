@@ -1201,10 +1201,7 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         if not self.request.user.is_staff:
             raise PermissionDenied("Only admin can delete plans.")
-
-        # Soft delete instead of actual delete
-        instance.is_active = False
-        instance.save()
+        instance.delete()
 
 class PlanPricingViewSet(viewsets.ModelViewSet):
     queryset = PlanPricing.objects.all()
