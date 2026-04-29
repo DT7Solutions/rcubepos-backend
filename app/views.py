@@ -45,6 +45,8 @@ from .serializers import *
 from .utils import *
 from .permissions import *
 
+logger = logging.getLogger(__name__)
+
 # Create your views here.
 
 # ========================= # AUTH VIEWS # =========================
@@ -1220,20 +1222,55 @@ class PlanPricingViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         if not self.request.user.is_staff:
             raise PermissionDenied("Admin only")
-        serializer.save()
+        
+        try:
+            with transaction.atomic():
+                pricing = serializer.save()
+                ensure_stripe_product_and_price(pricing)
+                
+            logger.info(f"PlanPricing created and synced with Stripe: {pricing.id}")
+        except Exception as e:
+            logger.error(f"Failed to create PlanPricing or sync with Stripe: {str(e)}")
+            # We raise a ValidationError so DRF returns a 400 with the message
+            raise ValidationError({"error": f"Stripe sync failed: {str(e)}"})
 
     def perform_update(self, serializer):
         if not self.request.user.is_staff:
             raise PermissionDenied("Admin only")
-        serializer.save()
+        
+        old_instance = self.get_object()
+        old_price = old_instance.price
+        old_currency = old_instance.currency
+        
+        try:
+            with transaction.atomic():
+                updated_instance = serializer.save()
+
+                # If price or currency changed, we MUST create a new Stripe price
+                # because Stripe prices are immutable.
+                if old_price != updated_instance.price or old_currency != updated_instance.currency:
+                    logger.info(f"Price/currency changed for pricing {updated_instance.id}, creating new Stripe price")
+                    
+                    # Force creation of a new price by clearing the old ID
+                    updated_instance.stripe_price_id = None
+                    ensure_stripe_product_and_price(updated_instance)
+                else:
+                    # Just ensure everything is in sync
+                    ensure_stripe_product_and_price(updated_instance)
+
+            logger.info(f"PlanPricing updated and synced with Stripe: {updated_instance.id}")
+        except Exception as e:
+            logger.error(f"Failed to update PlanPricing or sync with Stripe: {str(e)}")
+            raise ValidationError({"error": f"Stripe sync failed: {str(e)}"})
 
     def perform_destroy(self, instance):
         if not self.request.user.is_staff:
             raise PermissionDenied("Admin only")
+        # Note: We don't delete the product/price from Stripe as it might 
+        # be used by existing subscriptions. We just delete it locally.
         instance.delete()
 
-# ========================= views.py =========================
-
+# ========================= # PAYMENT VIEWS # =========================
 class CreateCheckoutSessionView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]

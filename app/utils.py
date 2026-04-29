@@ -332,6 +332,83 @@ def extract_stripe_metadata(stripe_obj) -> dict:
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
+def create_stripe_product(plan):
+    """
+    Creates a Stripe Product for a given plan.
+    """
+    try:
+        product = stripe.Product.create(
+            name=plan.name,
+            description=getattr(plan, 'description', f"RCube {plan.name} Subscription"),
+            metadata={
+                "plan_id": str(plan.id),
+                "app": "RCube-Smart"
+            }
+        )
+        return product
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe product creation failed for plan {plan.id}: {str(e)}")
+        raise Exception(f"Stripe product creation failed: {str(e)}")
+
+def create_stripe_price(product_id, pricing):
+    """
+    Creates a Stripe Price for a given product and pricing.
+    """
+    interval_map = {
+        "monthly": "month",
+        "yearly": "year"
+    }
+    
+    interval = interval_map.get(pricing.plan.interval)
+    if not interval:
+        raise ValueError(f"Invalid plan interval: {pricing.plan.interval}")
+
+    try:
+        # unit_amount is in cents
+        unit_amount = int(pricing.price * 100)
+        
+        price = stripe.Price.create(
+            product=product_id,
+            unit_amount=unit_amount,
+            currency=pricing.currency.lower() or "usd",
+            recurring={"interval": interval},
+            metadata={
+                "pricing_id": str(pricing.id),
+                "plan_id": str(pricing.plan.id)
+            }
+        )
+        return price
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe price creation failed for pricing {pricing.id}: {str(e)}")
+        raise Exception(f"Stripe price creation failed: {str(e)}")
+
+def ensure_stripe_product_and_price(pricing):
+    """
+    Ensures that a Stripe Product and Price exist for the given pricing.
+    Updates the plan and pricing models with the Stripe IDs.
+    """
+    plan = pricing.plan
+    
+    # 1. Ensure Product exists
+    if not plan.stripe_product_id:
+        product = create_stripe_product(plan)
+        plan.stripe_product_id = product.id
+        plan.save(update_fields=["stripe_product_id"])
+    
+    # 2. Ensure Price exists or create new if price/currency changed
+    # Stripe prices are immutable, so we always create a new one if it's missing or needs update
+    if not pricing.stripe_price_id:
+        price = create_stripe_price(plan.stripe_product_id, pricing)
+        pricing.stripe_price_id = price.id
+        pricing.save(update_fields=["stripe_price_id"])
+    else:
+        # Optionally verify if the price on Stripe matches our local price
+        # For now, we assume if stripe_price_id exists and we are calling this 
+        # because of an update, we might want to force a new one.
+        pass
+    
+    return plan.stripe_product_id, pricing.stripe_price_id
+
 def create_checkout_session(user, plan, pricing, subscription):
     if not pricing.stripe_price_id:
         raise ValueError(
@@ -374,7 +451,8 @@ def create_checkout_session(user, plan, pricing, subscription):
             exc_info=True
         )
         raise
-def extract_stripe_payment_details(invoice_id, logger):
+
+def extract_stripe_payment_details(invoice_id, logger):
     """
     Given a Stripe Invoice ID, fetch the invoice and extract payment details.
 

@@ -239,6 +239,8 @@ class SubscriptionPlan(models.Model):
     popular = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
 
+    stripe_product_id = models.CharField(max_length=255, null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
