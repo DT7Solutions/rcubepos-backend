@@ -21,5 +21,5 @@ class IsSubscriptionActive(BasePermission):
         if not subscription or not subscription.plan:
             return False
         
-        return subscription.get_status() == 'active'
+        return subscription.status in ['active', 'trialing'] and subscription.current_period_end > now()
     

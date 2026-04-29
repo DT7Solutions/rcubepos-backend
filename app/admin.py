@@ -48,7 +48,17 @@ class SubscriptionPlanAdmin(admin.ModelAdmin):
 
 @admin.register(Subscription)
 class SubscriptionAdmin(admin.ModelAdmin):
-    list_display = ('id', 'user', 'restaurant', 'plan', 'status', 'start_date', 'end_date')
+    list_display = (
+        'id', 'user', 'plan', 'status',
+        'stripe_subscription_id',
+        'current_period_start', 'current_period_end',
+        'created_at'
+    )
+    readonly_fields = (
+        'stripe_subscription_id',
+        'current_period_start',
+        'current_period_end',
+    )
     list_filter = ('status',)
     search_fields = ('user__username', 'restaurant__name')
     ordering = ('-created_at',)
@@ -69,20 +79,24 @@ class InvoiceInline(admin.TabularInline):
 class PaymentTransactionAdmin(admin.ModelAdmin):
     list_display = (
         'id', 'user', 'subscription', 'status',
-        'base_amount', 'discount_amount', 'gst_amount', 'final_amount',
-        'refunded_amount', 'payment_method', 'created_at'
+        'base_amount', 'final_amount',
+        'stripe_payment_intent_id',
+        'stripe_invoice_id',
+        'created_at'
     )
 
     list_filter = ('status', 'payment_method', 'currency')
     search_fields = (
         'user__username',
         'stripe_payment_intent_id',
-        'stripe_session_id'
+        'stripe_session_id',
+        'stripe_invoice_id'
     )
 
     readonly_fields = (
         'stripe_session_id',
         'stripe_payment_intent_id',
+        'stripe_invoice_id',
         'created_at',
         'paid_at'
     )
@@ -105,14 +119,25 @@ class RefundAdmin(admin.ModelAdmin):
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
     list_display = (
-        'id', 'subscription', 'base_amount', 'discount_amount',
-        'gst_amount', 'total_amount', 'status', 'date'
+        'id', 'subscription',
+        'stripe_invoice_id',
+        'total_amount',
+        'status',
+        'date'
     )
 
     list_filter = ('status', 'plan_interval')
-    search_fields = ('invoice_number', 'subscription__user__username')
+    search_fields = (
+        'invoice_number',
+        'stripe_invoice_id',
+        'subscription__user__username'
+    )
 
-    readonly_fields = ('invoice_number', 'created_at')
+    readonly_fields = (
+        'invoice_number',
+        'stripe_invoice_id',
+        'created_at'
+    )
 
     ordering = ('-created_at',)
 
@@ -126,7 +151,22 @@ class PlatformSettingsAdmin(admin.ModelAdmin):
 # ================= STRIPE LOGS =================
 @admin.register(StripeWebhookLog)
 class StripeWebhookLogAdmin(admin.ModelAdmin):
-    list_display = ('event_id', 'event_type', 'processed', 'created_at')
+    list_display = (
+        'event_id',
+        'event_type',
+        'processed',
+        'processing_error',
+        'created_at'
+    )
     search_fields = ('event_id', 'event_type')
     list_filter = ('processed',)
     ordering = ('-created_at',)
+    readonly_fields = ('payload',)
+
+@admin.register(PlanPricing)
+class PlanPricingAdmin(admin.ModelAdmin):
+    list_display = (
+        'id', 'plan', 'country', 'currency', 'price', 'stripe_price_id', 'is_active'
+    )
+    search_fields = ('plan__name', 'country', 'stripe_price_id')
+    list_filter = ('country', 'currency', 'is_active')

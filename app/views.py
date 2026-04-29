@@ -1,5 +1,5 @@
 from requests import session
-from rest_framework import status, viewsets, permissions, generics 
+from rest_framework import metadata, status, viewsets, permissions, generics 
 from rest_framework.views import APIView, View
 from rest_framework.generics import ListAPIView
 from rest_framework.response import Response
@@ -962,7 +962,7 @@ class RestaurantViewSet(viewsets.ModelViewSet):
             raise ValidationError({"plan_id": "This field is required."})
         
         try:
-            plan = SubscriptionPlan.objects.get(id=plan_id)
+            plan = SubscriptionPlan.objects.get(id=int(plan_id))
         except SubscriptionPlan.DoesNotExist:
             raise ValidationError({"plan_id": "Invalid plan ID."})
 
@@ -1232,6 +1232,8 @@ class PlanPricingViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Admin only")
         instance.delete()
 
+# ========================= views.py =========================
+
 class CreateCheckoutSessionView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
@@ -1244,43 +1246,79 @@ class CreateCheckoutSessionView(APIView):
             return Response({"error": "plan_id is required"}, status=400)
 
         try:
-            plan = SubscriptionPlan.objects.get(id=plan_id, is_active=True)
-        except SubscriptionPlan.DoesNotExist:
-            return Response({"error": "Invalid plan"}, status=400)
+            plan = SubscriptionPlan.objects.get(id=int(plan_id), is_active=True)
+        except (SubscriptionPlan.DoesNotExist, ValueError):
+            return Response({"error": "Invalid or inactive plan"}, status=400)
 
-        sub, _ = Subscription.objects.get_or_create(user=user)
+        # ── Subscription: one per user, get or create safely ──────────────
+        with transaction.atomic():
+            # Use select_for_update to prevent race conditions on concurrent
+            # requests from the same user hitting this endpoint simultaneously
+            existing_subs = (
+                Subscription.objects
+                .select_for_update()
+                .filter(user=user)
+                .order_by('-created_at')
+            )
 
-        if sub.status == "active":
-            return Response({"error": "You already have an active subscription"}, status=400)
+            if existing_subs.filter(status='active').exists():
+                return Response(
+                    {"error": "You already have an active subscription"},
+                    status=400
+                )
 
-        # ================= GET COUNTRY =================
-        country = user.billing_country if user.billing_country else "US"
+            # Take the most recent non-active one, or create fresh
+            sub = existing_subs.first()
+            if not sub:
+                sub = Subscription.objects.create(user=user, status='none')
 
-        # ================= GET PRICING =================
+        # ── Pricing ───────────────────────────────────────────────────────
+        country = (
+            user.billing_country
+            if user.billing_country
+            else "US"
+        )
         pricing = get_plan_pricing(plan, country)
 
         if not pricing:
-            return Response({"error": "Pricing not available for this country"}, status=400)
+            return Response(
+                {"error": f"No pricing available for country '{country}'"},
+                status=400
+            )
 
-        # ================= CREATE PAYMENT =================
+        # ── Stripe session ────────────────────────────────────────────────
+        try:
+            session = create_checkout_session(
+                user=user,
+                plan=plan,
+                pricing=pricing,
+                subscription=sub,
+            )
+        except ValueError as e:
+            return Response({"error": str(e)}, status=400)
+        except stripe.error.StripeError as e:
+            return Response(
+                {"error": "Payment provider error. Please try again later."},
+                status=502
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error creating checkout session "
+                f"for user={user.id}: {str(e)}",
+                exc_info=True
+            )
+            return Response({"error": "Unexpected error occurred"}, status=500)
+
+        # ── Payment transaction record ────────────────────────────────────
         payment = PaymentTransaction.objects.create(
             user=user,
             subscription=sub,
             base_amount=pricing.price,
             currency=pricing.currency,
             country=pricing.country,
+            stripe_session_id=session.id,
             status='initiated',
         )
-
-        # ================= STRIPE SESSION =================
-        session = create_checkout_session(
-            user=user,
-            plan=plan,
-            pricing=pricing  # IMPORTANT
-        )
-
-        payment.stripe_session_id = session.id
-        payment.save()
 
         sub.last_session_created_at = now()
         sub.save(update_fields=["last_session_created_at"])
@@ -1289,10 +1327,8 @@ class CreateCheckoutSessionView(APIView):
             "url": session.url,
             "session_id": session.id,
             "country": pricing.country,
-            "currency": pricing.currency
+            "currency": pricing.currency,
         })
-
-# ========================= # STRIPE WEBHOOK & VERIFY =========================
 
 @method_decorator(csrf_exempt, name='dispatch')
 class StripeWebhookView(APIView):
@@ -1304,43 +1340,38 @@ class StripeWebhookView(APIView):
 
         try:
             event = stripe.Webhook.construct_event(
-                payload,
-                sig_header,
-                settings.STRIPE_WEBHOOK_SECRET
+                payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
             )
         except stripe.error.SignatureVerificationError:
-            logger.error("Stripe Webhook Signature Verification Failed.")
+            logger.warning("Stripe webhook signature verification failed")
             return JsonResponse({"error": "Invalid signature"}, status=400)
         except Exception as e:
-            logger.error(f"Stripe Webhook Payload Error: {str(e)}")
+            logger.error(f"Stripe webhook payload error: {str(e)}")
             return JsonResponse({"error": "Invalid payload"}, status=400)
 
         event_id = event.id
+        event_type = event.type
 
-        # Idempotency check - if already PROCESSED, ignore.
-        # If it failed previously (processed=False), allow Stripe to retry.
+        # ── Idempotency: skip already-processed events ─────────────────────
         existing_log = StripeWebhookLog.objects.filter(event_id=event_id).first()
         if existing_log and existing_log.processed:
             return JsonResponse({"status": "already processed"}, status=200)
 
-        event_type = event.type
         data = event.data.object
 
         try:
             if event_type == "checkout.session.completed":
-                self.handle_successful_payment(data)
-            elif event_type == "checkout.session.expired":
-                self.handle_expired_session(data)
-            elif event_type == "payment_intent.payment_failed":
-                self.handle_failed_payment(data)
-            elif event_type == "payment_intent.canceled":
-                self.handle_cancelled_payment(data)
-            elif event_type == "charge.refunded":
-                self.handle_refund(data)
-            elif event_type == "checkout.session.async_payment_succeeded":
-                self.handle_successful_payment(data)
-            elif event_type == "checkout.session.async_payment_failed":
-                self.handle_expired_session(data)
+                self.handle_checkout_completed(data)
+            elif event_type == "invoice.payment_succeeded":
+                self.handle_invoice_payment_success(data)
+            elif event_type == "invoice.payment_failed":
+                self.handle_invoice_payment_failed(data)
+            elif event_type == "customer.subscription.deleted":
+                self.handle_subscription_deleted(data)
+            elif event_type == "customer.subscription.updated":
+                self.handle_subscription_updated(data)
+            else:
+                logger.debug(f"Unhandled webhook event type: {event_type}")
 
             # Log success
             if existing_log:
@@ -1351,12 +1382,15 @@ class StripeWebhookView(APIView):
                 StripeWebhookLog.objects.create(
                     event_id=event_id,
                     event_type=event_type,
-                    payload=event.to_dict(),
-                    processed=True
+                    payload={"id": event.id, "type": event.type, "created": event.created},
+                    processed=True,
                 )
 
         except Exception as e:
-            logger.error(f"Failed to process webhook event {event_id}: {str(e)}", exc_info=True)
+            logger.error(
+                f"Failed to process webhook {event_id} ({event_type}): {str(e)}",
+                exc_info=True
+            )
             if existing_log:
                 existing_log.processing_error = str(e)
                 existing_log.save()
@@ -1364,205 +1398,289 @@ class StripeWebhookView(APIView):
                 StripeWebhookLog.objects.create(
                     event_id=event_id,
                     event_type=event_type,
-                    payload=event.to_dict(),
+                    payload={"id": event.id, "type": event.type, "created": event.created},
                     processed=False,
-                    processing_error=str(e)
+                    processing_error=str(e),
                 )
-            # Return 500 so Stripe knows to retry
             return JsonResponse({"error": "Webhook processing failed"}, status=500)
 
         return JsonResponse({"status": "success"})
 
-    def handle_successful_payment(self, session):
-        if session.payment_status != "paid":
-            logger.info(f"Webhook checkout.session.completed called but status is {session.payment_status}. Skipping.")
+    def handle_checkout_completed(self, session):
+        metadata = extract_stripe_metadata(session.metadata)
+        session_id = session.id
+
+        # Validate all required metadata upfront
+        required_keys = ["subscription_id", "plan_id", "user_id"]
+        missing = [k for k in required_keys if not metadata.get(k)]
+        if missing:
+            raise Exception(
+                f"Webhook checkout.session.completed missing metadata: {missing}"
+            )
+
+        subscription_id = metadata["subscription_id"]
+        plan_id = metadata["plan_id"]
+        user_id = metadata["user_id"]
+
+        try:
+            plan = SubscriptionPlan.objects.get(id=int(plan_id))
+        except (SubscriptionPlan.DoesNotExist, ValueError):
+            raise Exception(f"Plan {plan_id} not found")
+
+        with transaction.atomic():
+            payment = (
+                PaymentTransaction.objects
+                .select_for_update()
+                .filter(stripe_session_id=session_id)
+                .first()
+            )
+
+            if not payment:
+                raise Exception(
+                    f"No PaymentTransaction found for session {session_id}"
+                )
+
+            sub = payment.subscription
+            if not sub:
+                raise Exception(
+                    f"Payment {payment.id} has no linked Subscription"
+                )
+
+            # Integrity check: metadata user must match subscription owner
+            if str(user_id) != str(sub.user_id):
+                raise Exception(
+                    f"User mismatch: metadata user_id={user_id} "
+                    f"but subscription.user_id={sub.user_id}"
+                )
+
+            # Integrity check: metadata subscription must match payment's sub
+            if str(subscription_id) != str(sub.id):
+                raise Exception(
+                    f"Subscription mismatch: metadata subscription_id={subscription_id} "
+                    f"but payment.subscription_id={sub.id}"
+                )
+
+            process_initial_subscription(payment, plan, session)
+
+    def handle_invoice_payment_success(self, invoice):
+        from datetime import datetime, timezone as dt_timezone
+
+        stripe_sub_id = getattr(invoice, "subscription", None)
+        if not stripe_sub_id:
             return
 
-        session_id = session.id
-        payment_intent = session.payment_intent
+        sub = Subscription.objects.filter(
+            stripe_subscription_id=stripe_sub_id
+        ).first()
 
-        metadata = getattr(session, "metadata", {}) or {}
-        plan_id = metadata.get("plan_id") if isinstance(metadata, dict) else getattr(metadata, "plan_id", None)
-        user_id = metadata.get("user_id") if isinstance(metadata, dict) else getattr(metadata, "user_id", None)
-
-        if not session_id or not payment_intent:
-            logger.warning("Handle successful payment missing session_id or payment_intent.")
+        if not sub:
+            logger.warning(
+                f"invoice.payment_succeeded: no subscription found "
+                f"for stripe_subscription_id={stripe_sub_id}"
+            )
             return
 
         try:
-            plan = SubscriptionPlan.objects.get(id=plan_id)
-        except SubscriptionPlan.DoesNotExist:
-            logger.error(f"Plan ID {plan_id} not found during successful payment processing.")
+            lines = getattr(invoice, "lines", None)
+            if not lines or not lines.data:
+                logger.warning(f"Invoice {invoice.id} has no line items — skipping period update")
+                return
+
+            period = getattr(lines.data[0], "period", None)
+            if not period:
+                logger.warning(f"Invoice {invoice.id} line has no period — skipping")
+                return
+
+            sub.current_period_start = datetime.fromtimestamp(
+                period.start, tz=dt_timezone.utc
+            )
+            sub.current_period_end = datetime.fromtimestamp(
+                period.end, tz=dt_timezone.utc
+            )
+            sub.status = "active"
+            sub.save(update_fields=[
+                "current_period_start",
+                "current_period_end",
+                "status"
+            ])
+
+        except Exception as e:
+            # Re-raise so the webhook handler logs it and returns 500 for retry
+            raise Exception(f"Failed to update subscription periods: {str(e)}")
+
+    def handle_invoice_payment_failed(self, invoice):
+        stripe_sub_id = getattr(invoice, "subscription", None)
+        if not stripe_sub_id:
             return
 
-        with transaction.atomic():
-            # CAITICAL ISSUE FORMAT FIX: Use filter().first() instead of get().first() to avoid race conditions
-            payment = PaymentTransaction.objects.select_for_update().filter(stripe_session_id=session_id).first()
-            if not payment:
-                logger.error(f"PaymentTransaction for session_id {session_id} not found!")
-                return
+        updated = Subscription.objects.filter(
+            stripe_subscription_id=stripe_sub_id
+        ).update(status="past_due")
 
-            sub = payment.subscription
-
-            # Safety check
-            if str(user_id) != str(sub.user_id):
-                logger.error(f"User mismatch in successful payment! Expected: {sub.user_id}, Provided in Session: {user_id}")
-                return
-
-            payment_method = "unknown"
-            try:
-                intent = stripe.PaymentIntent.retrieve(payment_intent)
-                charge_id = getattr(intent, "latest_charge", None)
-                if charge_id:
-                    charge = stripe.Charge.retrieve(charge_id)
-                    payment_method_details = getattr(charge, "payment_method_details", None)
-                    if payment_method_details:
-                        payment_method = getattr(payment_method_details, "type", "unknown")
-            except Exception as e:
-                logger.warning(f"Could not retrieve Stripe PaymentIntent details entirely: {str(e)}")
-            
-            process_successful_payment(payment, plan, payment_intent, payment_method)
-
-
-    def handle_expired_session(self, session):
-        session_id = session.id
-        if not session_id:
-            return
-
-        with transaction.atomic():
-            payment = PaymentTransaction.objects.select_for_update().filter(stripe_session_id=session_id).first()
-            if not payment:
-                return
-
-            if payment.status == "success":
-                return
-
-            payment.status = "failed"
-            payment.failure_reason = "Session expired"
-            payment.save()
-
-
-    def handle_failed_payment(self, intent):
-        payment_intent_id = intent.id
-        if not payment_intent_id:
-            return
-
-        with transaction.atomic():
-            payment = PaymentTransaction.objects.select_for_update().filter(stripe_payment_intent_id=payment_intent_id).first()
-            if not payment:
-                return
-
-            if payment.status == "success":
-                return
-
-            failure_reason = (
-                intent.last_payment_error.message
-                if intent.last_payment_error
-                else "Payment failed"
+        if not updated:
+            logger.warning(
+                f"invoice.payment_failed: no subscription found "
+                f"for stripe_subscription_id={stripe_sub_id}"
             )
 
-            payment.status = "failed"
-            payment.failure_reason = failure_reason
-            payment.save()
+    def handle_subscription_deleted(self, subscription):
+        updated = Subscription.objects.filter(
+            stripe_subscription_id=subscription.id
+        ).update(status="cancelled")
 
+        if not updated:
+            logger.warning(
+                f"customer.subscription.deleted: no subscription found "
+                f"for stripe_subscription_id={subscription.id}"
+            )
 
-    def handle_cancelled_payment(self, intent):
-        payment_intent_id = intent.id
-        if not payment_intent_id:
+    def handle_subscription_updated(self, subscription):
+        """
+        Fired by Stripe whenever a subscription changes status.
+        Keeps our local status in sync with Stripe's source of truth.
+        """
+        stripe_sub_id = subscription.id
+        stripe_status = getattr(subscription, "status", None)
+
+        if not stripe_status:
             return
 
-        with transaction.atomic():
-            payment = PaymentTransaction.objects.select_for_update().filter(stripe_payment_intent_id=payment_intent_id).first()
-            if not payment:
-                return
+        # Map Stripe statuses to our local statuses
+        STATUS_MAP = {
+            "active": "active",
+            "past_due": "past_due",
+            "unpaid": "past_due",       # treat unpaid same as past_due
+            "canceled": "cancelled",
+            "incomplete": "incomplete",
+            "incomplete_expired": "cancelled",
+            "trialing": "trialing",
+            "paused": "past_due",
+        }
 
-            if payment.status == "success":
-                return
-
-            payment.status = "failed"
-            payment.failure_reason = "Payment cancelled"
-            payment.save()
-
-
-    def handle_refund(self, charge):
-        payment_intent_id = charge.payment_intent
-        if not payment_intent_id:
+        local_status = STATUS_MAP.get(stripe_status)
+        if not local_status:
+            logger.warning(
+                f"customer.subscription.updated: unknown Stripe status "
+                f"'{stripe_status}' for {stripe_sub_id}"
+            )
             return
 
-        with transaction.atomic():
-            payment = PaymentTransaction.objects.select_for_update().filter(stripe_payment_intent_id=payment_intent_id).first()
-            if not payment:
-                return
+        updated = Subscription.objects.filter(
+            stripe_subscription_id=stripe_sub_id
+        ).update(status=local_status)
 
-            payment.status = "refunded"
-            payment.refunded_amount = (charge.amount_refunded or 0) / 100
-            payment.save()
+        if not updated:
+            logger.warning(
+                f"customer.subscription.updated: no subscription found "
+                f"for stripe_subscription_id={stripe_sub_id}"
+            )
+        else:
+            logger.info(
+                f"Subscription {stripe_sub_id} status synced to '{local_status}' "
+                f"from Stripe status '{stripe_status}'"
+            )
 
-
-# ---------------------- VERIFY PAYMENT ENDPOINT ---------------------- #
 @method_decorator(csrf_exempt, name='dispatch')
 class VerifyPaymentView(APIView):
-    permission_classes = [AllowAny]
+    # Authenticated — prevents arbitrary session_id probing
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
         session_id = request.data.get("session_id")
         if not session_id:
-            return Response({"error": "session_id required"}, status=400)
+            return Response({"error": "session_id is required"}, status=400)
 
-        # 1. Fetch Session from Stripe
+        payment = (
+            PaymentTransaction.objects
+            .filter(stripe_session_id=session_id)
+            .select_related("subscription__plan")
+            .first()
+        )
+
+        if not payment:
+            return Response({"error": "Payment not found"}, status=404)
+
+        # Ownership check — users can only verify their own payments
+        if payment.user_id != request.user.id:
+            return Response({"error": "Forbidden"}, status=403)
+
+        sub = payment.subscription
+
+        # Webhook already handled it
+        if payment.status == "success":
+            return Response({
+                "message": "Payment already activated",
+                "status": sub.status if sub else "unknown",
+            })
+
+        # Fallback: poll Stripe directly
         try:
-            session = stripe.checkout.Session.retrieve(session_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch session {session_id} from Stripe: {str(e)}")
-            return Response({"error": "Invalid session"}, status=400)
+            session = stripe.checkout.Session.retrieve(
+                session_id, expand=["subscription"]
+            )
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe session retrieve failed for {session_id}: {str(e)}")
+            return Response(
+                {"error": "Could not verify payment with Stripe"},
+                status=502
+            )
 
         if session.payment_status != "paid":
-            return Response({"error": "Payment not completed"}, status=400)
+            return Response({
+                "message": "Payment not completed yet",
+                "payment_status": session.payment_status,
+            }, status=202)
 
-        if not session.payment_intent:
-            return Response({"error": "Payment intent not found"}, status=400)
+        if not session.subscription:
+            return Response({"error": "No subscription attached to session"}, status=400)
 
-        # 2. Extract Metadata
-        metadata = session.metadata if session.metadata else {}
-        plan_id = getattr(metadata, "plan_id", None) or metadata.get("plan_id")
-        user_id = getattr(metadata, "user_id", None) or metadata.get("user_id")
+        metadata = extract_stripe_metadata(session.metadata)
+        plan_id = metadata.get("plan_id")
+        user_id = metadata.get("user_id")
 
         if not plan_id or not user_id:
-            return Response({"error": "Invalid metadata inside session"}, status=400)
+            return Response({"error": "Session metadata incomplete"}, status=400)
+
+        # Ownership check against metadata too
+        if str(user_id) != str(request.user.id):
+            return Response({"error": "Forbidden"}, status=403)
 
         try:
             plan = SubscriptionPlan.objects.get(id=int(plan_id))
-        except SubscriptionPlan.DoesNotExist:
+        except (SubscriptionPlan.DoesNotExist, ValueError):
             return Response({"error": "Plan not found"}, status=400)
 
-        # 3. Apply shared Idempotent Activation Logic
-        with transaction.atomic():
-            payment = PaymentTransaction.objects.select_for_update().filter(stripe_session_id=session_id).first()
-            if not payment:
-                return Response({"error": "Payment transaction not found"}, status=404)
+        try:
+            with transaction.atomic():
+                # Re-fetch with lock to prevent race with webhook
+                payment = (
+                    PaymentTransaction.objects
+                    .select_for_update()
+                    .get(id=payment.id)
+                )
 
-            sub = payment.subscription
+                # Double-check after acquiring lock
+                if payment.status == "success":
+                    return Response({
+                        "message": "Payment already activated",
+                        "status": payment.subscription.status,
+                    })
 
-            if str(user_id) != str(sub.user_id):
-                return Response({"error": "Unauthorized! Session user mismatch"}, status=403)
+                process_initial_subscription(payment, plan, session)
 
-            # Idempotency safety
-            if payment.status != "success":
-                # Ensure we sync standard data on manual verification
-                payment_method = "unknown"
-                try:
-                    intent = stripe.PaymentIntent.retrieve(session.payment_intent)
-                    if intent.payment_method_types:
-                        payment_method = intent.payment_method_types[0]
-                except Exception:
-                    pass
-                
-                process_successful_payment(payment, plan, session.payment_intent, payment_method)
-            else:
-                logger.info(f"VerifyPaymentView invoked but {session_id} was already activated by Webhook.")
+        except Exception as e:
+            logger.error(
+                f"Failed to activate payment {payment.id} via fallback: {str(e)}",
+                exc_info=True
+            )
+            return Response({"error": "Failed to activate subscription"}, status=500)
 
-        return Response({"message": "Subscription fully activated and verified."})
-
+        return Response({
+            "message": "Subscription activated",
+            "status": "active",
+        })
+    
 # ========================= # INVOICE VIEWS # ==========================
 logger = logging.getLogger(__name__)
 pdfmetrics.registerFont(TTFont('DejaVuSans', 'static/fonts/DejaVuSans.ttf'))
@@ -1585,37 +1703,41 @@ class InvoiceGenerator:
             raise Exception("Error fetching invoice data.")
 
     def generate_pdf(self):
-        """
-        Generate the PDF for the invoice.
-        """
         if not self.invoice:
-            raise ValueError("Invoice data is missing. Please fetch the invoice first.")
+            raise ValueError("Invoice data is missing.")
 
         response = HttpResponse(content_type='application/pdf')
-        response['Content-Disposition'] = f'attachment; filename="invoice_{self.invoice.invoice_number}.pdf"'
+        response['Content-Disposition'] = (
+            f'attachment; filename="invoice_{self.invoice.invoice_number}.pdf"'
+        )
 
-        # Set up the document layout
         doc = SimpleDocTemplate(
-            response, 
-            pagesize=letter, 
-            rightMargin=inch, 
-            leftMargin=inch, 
-            topMargin=inch, 
-            bottomMargin=inch
+            response,
+            pagesize=letter,
+            rightMargin=inch, leftMargin=inch,
+            topMargin=inch, bottomMargin=inch
         )
         elements = []
         styles = getSampleStyleSheet()
         normal_style = styles['Normal']
         normal_style.fontName = "DejaVuSans"
 
-        # 1. Header (Company Info & INVOICE title)
-        header_data = [
-            [
-                Paragraph("<b>RCube Smart POS</b><br/>123 Tech Lane<br/>Silicon Valley, CA 94025<br/>support@rcubepad.com", normal_style), 
-                Paragraph(f"<font size=20><b>INVOICE</b></font><br/><b>Date:</b> {self.invoice.date}<br/><b>Invoice #:</b> {self.invoice.invoice_number}<br/><b>Status:</b> {self.invoice.get_status_display()}", normal_style)
-            ]
-        ]
-        header_table = Table(header_data, colWidths=[3.5*inch, 3*inch])
+        # ── 1. Header ─────────────────────────────────────────────────────
+        header_data = [[
+            Paragraph(
+                "<b>RCube Smart POS</b><br/>44 Glen Hill Dr<br/>"
+                "Oshawa, CA L1N 7A1<br/>support@rcubesmart.com",
+                normal_style
+            ),
+            Paragraph(
+                f"<font size=20><b>INVOICE</b></font><br/>"
+                f"<b>Date:</b> {self.invoice.date}<br/>"
+                f"<b>Invoice #:</b> {self.invoice.invoice_number}<br/>"
+                f"<b>Status:</b> {self.invoice.get_status_display()}",
+                normal_style
+            )
+        ]]
+        header_table = Table(header_data, colWidths=[3.5 * inch, 3 * inch])
         header_table.setStyle(TableStyle([
             ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
@@ -1623,48 +1745,53 @@ class InvoiceGenerator:
         elements.append(header_table)
         elements.append(Spacer(1, 40))
 
-        # 2. Bill To Information
+        # ── 2. Bill To + Payment Info ─────────────────────────────────────
         user = self.invoice.subscription.user
         restaurant = self.invoice.subscription.restaurant
-        bill_to_text = f"<b>Bill To:</b><br/>{user.first_name or ''} {user.last_name or ''}<br/>{user.email}<br/>"
-        
+
+        # Resolve currency symbol from invoice.currency (source of truth)
+        currency_symbol_map = {'inr': '₹', 'usd': '$', 'cad': '$', 'eur': '€', 'gbp': '£'}
+        currency_symbol = currency_symbol_map.get(
+            self.invoice.currency.lower(), self.invoice.currency.upper() + ' '
+        )
+
+        # Billing details stored as metadata (not line items)
+        billing_details = self.invoice.billing_details or {}
+        payment_method = billing_details.get("payment_method", "")
+        billing_country = billing_details.get("country", "") or getattr(user, 'billing_country', '')
+
+        bill_to_text = (
+            f"<b>Bill To:</b><br/>"
+            f"{user.first_name or ''} {user.last_name or ''}<br/>"
+            f"{user.email}<br/>"
+        )
+
         if restaurant:
             bill_to_text += f"<b>Restaurant:</b> {restaurant.name}<br/>{restaurant.address}<br/>"
         else:
-            bill_to_text += f"{user.address or ''}<br/>{user.city or ''} {user.state or ''} {user.pincode or ''}<br/>"
-            
+            bill_to_text += (
+                f"{user.address or ''}<br/>"
+                f"{user.city or ''} {user.state or ''} {user.pincode or ''}<br/>"
+            )
+
+        if billing_country:
+            bill_to_text += f"<b>Country:</b> {billing_country}<br/>"
+
+        if payment_method:
+            bill_to_text += f"<b>Payment Method:</b> {payment_method.replace('_', ' ').title()}<br/>"
+
         elements.append(Paragraph(bill_to_text, normal_style))
         elements.append(Spacer(1, 30))
 
-        # 3. Line Items Table
-        billing_country = getattr(user, 'billing_country', None)
-        currency_mapping = {
-            'IN': '₹',
-            'US': '$',
-            'CA': '$',
-        }
-        currency_symbol = currency_mapping.get(billing_country, '$') if billing_country else '$'
-        data = [
-            ["Description", "Interval", "Amount"]
-        ]
-        
-        # Add the main subscription item
+        # ── 3. Line Items (subscription only — no billing_details dump) ───
+        data = [["Description", "Interval", "Amount"]]
         data.append([
             f"{self.invoice.plan_name} Subscription",
             self.invoice.plan_interval.capitalize(),
-            Paragraph(f"{currency_symbol} {self.invoice.base_amount}", normal_style)
+            Paragraph(f"{currency_symbol}{self.invoice.base_amount}", normal_style)
         ])
-        
-        # Add Billing Details as extra line items (if any)
-        billing_details = self.invoice.billing_details or {}
-        for key, value in billing_details.items():
-            data.append([
-                key.capitalize(),
-                "—",
-                f"{currency_symbol} {value}"
-            ])
-            
-        table = Table(data, colWidths=[4*inch, 1.25*inch, 1.25*inch])
+
+        table = Table(data, colWidths=[4 * inch, 1.25 * inch, 1.25 * inch])
         table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f3f4f6')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#374151')),
@@ -1679,14 +1806,14 @@ class InvoiceGenerator:
         elements.append(table)
         elements.append(Spacer(1, 20))
 
-        # 4. Summary Table (Subtotal, Discount, GST, Total)
+        # ── 4. Summary ────────────────────────────────────────────────────
         summary_data = [
-            ["Subtotal:", Paragraph(f"{currency_symbol} {self.invoice.base_amount}", normal_style)],
-            ["Discount:", Paragraph(f"- {currency_symbol} {self.invoice.discount_amount}", normal_style)],
-            ["GST / Taxes:", Paragraph(f"{currency_symbol} {self.invoice.gst_amount}", normal_style)],
-            ["Total Amount:", Paragraph(f"{currency_symbol} {self.invoice.total_amount}", normal_style)]
+            ["Subtotal:", Paragraph(f"{currency_symbol}{self.invoice.base_amount}", normal_style)],
+            ["Discount:", Paragraph(f"- {currency_symbol}{self.invoice.discount_amount}", normal_style)],
+            ["GST / Taxes:", Paragraph(f"{currency_symbol}{self.invoice.gst_amount}", normal_style)],
+            ["Total Amount:", Paragraph(f"{currency_symbol}{self.invoice.total_amount}", normal_style)],
         ]
-        summary_table = Table(summary_data, colWidths=[5.25*inch, 1.25*inch])
+        summary_table = Table(summary_data, colWidths=[5.25 * inch, 1.25 * inch])
         summary_table.setStyle(TableStyle([
             ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
             ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
@@ -1695,18 +1822,19 @@ class InvoiceGenerator:
             ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
             ('LINEBELOW', (0, -1), (-1, -1), 2, colors.black),
         ]))
-        
         elements.append(summary_table)
         elements.append(Spacer(1, 40))
 
-        # 5. Footer
-        footer_text = "<para align=center>Thank you for your business!<br/>If you have any questions regarding this invoice, please contact support.</para>"
-        elements.append(Paragraph(footer_text, normal_style))
+        # ── 5. Footer ─────────────────────────────────────────────────────
+        elements.append(Paragraph(
+            "<para align=center>Thank you for your business!<br/>"
+            "If you have any questions regarding this invoice, please contact support.</para>",
+            normal_style
+        ))
 
-        # Build the final document
         doc.build(elements)
         return response
-
+    
     def create_invoice_pdf(self):
         """
         Fetch invoice and generate PDF.

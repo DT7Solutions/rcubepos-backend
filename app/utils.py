@@ -1,3 +1,4 @@
+from decimal import Decimal
 import secrets
 from django.core.mail import send_mail
 from django.core.cache import cache
@@ -11,6 +12,22 @@ from rest_framework.response import Response
 import requests
 import json
 import stripe
+import logging
+from django.utils.timezone import now
+from .models import *
+from datetime import timedelta, datetime, timezone as dt_timezone
+import logging
+logger = logging.getLogger(__name__)
+
+# ------------------------------ DECIMAL CONVERSION FOR JSON SERIALIZATION ----------------------------- 
+def convert_decimals(obj):
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convert_decimals(i) for i in obj]
+    return obj
 
 # ----------------------------- JWT TOKEN GENERATION -----------------------------
 def get_tokens_for_user(user):
@@ -302,111 +319,245 @@ def get_plan_pricing(plan, country):
     return pricing
 
 # ============================= PAYMENT HELPER FUNCTIONS =============================
+
+def extract_stripe_metadata(stripe_obj) -> dict:
+    if not stripe_obj:
+        return {}
+    if hasattr(stripe_obj, 'to_dict'):
+        return stripe_obj.to_dict()
+    # Already a plain dict (e.g. in tests or older SDK versions)
+    if isinstance(stripe_obj, dict):
+        return stripe_obj
+    return {}
+
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-def create_checkout_session(user, plan, pricing):
-    """Create Stripe Checkout Session (one-time payment)"""
+def create_checkout_session(user, plan, pricing, subscription):
+    if not pricing.stripe_price_id:
+        raise ValueError(
+            f"No Stripe price ID configured for plan '{plan.name}' "
+            f"in country '{pricing.country}'"
+        )
 
     try:
         session = stripe.checkout.Session.create(
-            payment_method_types=['card'],  # support multiple methods
-            mode='payment',  # FIXED (manual flow)
-
+            mode='subscription',
             customer_email=user.email,
-
             line_items=[{
-                'price_data': {
-                    'currency': pricing.currency.lower(),  # ✅ match your pricing
-                    'product_data': {
-                        'name': plan.name,
-                    },
-                    'unit_amount': int(pricing.price * 100),
-                },
+                'price': pricing.stripe_price_id,
                 'quantity': 1,
             }],
-
             metadata={
-                'user_id': str(user.id),  # always string
+                'user_id': str(user.id),
                 'plan_id': str(plan.id),
                 'country': pricing.country,
+                'subscription_id': str(subscription.id),
             },
-
-            success_url=f"{settings.FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            success_url=(
+                f"{settings.FRONTEND_URL}/success"
+                f"?session_id={{CHECKOUT_SESSION_ID}}"
+            ),
             cancel_url=f"{settings.FRONTEND_URL}/dashboard",
         )
-
         return session
 
+    except stripe.error.InvalidRequestError as e:
+        logger.error(
+            f"Stripe invalid request for user={user.id} "
+            f"plan={plan.id}: {e.user_message}"
+        )
+        raise
+
     except stripe.error.StripeError as e:
-        # Better error visibility
-        raise Exception(f"Stripe Error: {str(e)}")
+        logger.error(
+            f"Stripe error creating checkout session for user={user.id}: {str(e)}",
+            exc_info=True
+        )
+        raise
 
-    except Exception as e:
-        raise Exception(f"Checkout Session Error: {str(e)}")
-
-def process_successful_payment(payment, plan, payment_intent_id, payment_method):
-    """
-    Robust centralized method to activate subscriptions and create invoices
-    after a successful Stripe payment.
-    MUST be called within `transaction.atomic()`.
-    """
-    import logging
-    from django.utils.timezone import now
-    from datetime import timedelta
-    from .models import Invoice
+def process_initial_subscription(payment, plan, session):
+    from datetime import datetime, timezone as dt_timezone
 
     logger = logging.getLogger(__name__)
 
-    # Idempotency check securely
     if payment.status == "success":
-        logger.info(f"PaymentTransaction {payment.id} already processed. Skipping.")
-        return True, "Payment already successfully processed."
+        logger.info(f"Payment {payment.id} already processed — skipping")
+        return True, "Already processed"
 
-    # Finalize PaymentTransaction record
-    payment.stripe_payment_intent_id = payment_intent_id
-    payment.payment_method = payment_method
+    raw_sub = getattr(session, "subscription", None)
+    if not raw_sub:
+        raise Exception(f"No Stripe subscription in session for payment {payment.id}")
+
+    stripe_subscription_id = raw_sub if isinstance(raw_sub, str) else raw_sub.id
+
+    sub = payment.subscription
+    if not sub:
+        raise Exception(f"Payment {payment.id} has no linked Subscription record")
+
+    current_period_start = None
+    current_period_end = None
+
+    try:
+        stripe_sub_obj = stripe.Subscription.retrieve(
+            stripe_subscription_id,
+            expand=[
+                "latest_invoice.payment_intent.payment_method",
+                "latest_invoice.charge",
+            ]
+        )
+
+        latest_invoice = getattr(stripe_sub_obj, "latest_invoice", None)
+
+        # ── DEBUG: log the raw structure so we can see what Stripe returns ─
+        logger.info(f"[DEBUG] stripe_subscription_id: {stripe_subscription_id}")
+        logger.info(f"[DEBUG] latest_invoice: {latest_invoice.id if latest_invoice else None}")
+
+        if latest_invoice:
+            payment.stripe_invoice_id = latest_invoice.id
+
+            # Log payment_intent raw value BEFORE any processing
+            raw_pi = getattr(latest_invoice, "payment_intent", None)
+            logger.info(f"[DEBUG] raw payment_intent type: {type(raw_pi)}, value: {raw_pi}")
+
+            # Log charge raw value
+            raw_charge = getattr(latest_invoice, "charge", None)
+            logger.info(f"[DEBUG] raw charge type: {type(raw_charge)}, value: {raw_charge}")
+
+            # ── Billing period ────────────────────────────────────────────
+            lines = getattr(latest_invoice, "lines", None)
+            if lines and lines.data:
+                period = getattr(lines.data[0], "period", None)
+                if period:
+                    current_period_start = datetime.fromtimestamp(
+                        period.start, tz=dt_timezone.utc
+                    )
+                    current_period_end = datetime.fromtimestamp(
+                        period.end, tz=dt_timezone.utc
+                    )
+
+            # ── PaymentIntent ─────────────────────────────────────────────
+            pi = raw_pi
+            if pi and hasattr(pi, "id"):
+                payment.stripe_payment_intent_id = pi.id
+                logger.info(f"[DEBUG] PI id: {pi.id}")
+
+                pm = getattr(pi, "payment_method", None)
+                logger.info(f"[DEBUG] pm type: {type(pm)}, value: {pm}")
+
+                if pm and not isinstance(pm, str):
+                    payment.payment_method = getattr(pm, "type", None)
+                    logger.info(f"[DEBUG] pm.type (expanded): {payment.payment_method}")
+
+                    billing = getattr(pm, "billing_details", None)
+                    address = getattr(billing, "address", None) if billing else None
+                    country = getattr(address, "country", None) if address else None
+                    if country and not payment.country:
+                        payment.country = country
+
+                elif pm and isinstance(pm, str):
+                    logger.info(f"[DEBUG] pm was a string ID, fetching separately: {pm}")
+                    try:
+                        pm_obj = stripe.PaymentMethod.retrieve(pm)
+                        payment.payment_method = getattr(pm_obj, "type", None)
+                        logger.info(f"[DEBUG] pm.type (fetched): {payment.payment_method}")
+                    except stripe.error.StripeError as e:
+                        logger.warning(f"[DEBUG] PaymentMethod fetch failed: {str(e)}")
+
+                else:
+                    logger.info(f"[DEBUG] pm is None or falsy — no payment method on PI")
+
+            else:
+                logger.info(f"[DEBUG] PI is None or has no id — skipping PI block")
+
+            # ── Fallback via charge ───────────────────────────────────────
+            if not payment.payment_method:
+                logger.info(f"[DEBUG] payment_method still empty, trying charge fallback")
+                charge = raw_charge
+                if charge and not isinstance(charge, str):
+                    pmd = getattr(charge, "payment_method_details", None)
+                    logger.info(f"[DEBUG] charge.payment_method_details: {pmd}")
+                    if pmd:
+                        payment.payment_method = getattr(pmd, "type", None)
+                        logger.info(f"[DEBUG] pmd.type: {payment.payment_method}")
+                elif charge and isinstance(charge, str):
+                    logger.info(f"[DEBUG] charge was a string ID (not expanded): {charge}")
+                else:
+                    logger.info(f"[DEBUG] charge is None")
+
+        logger.info(
+            f"[DEBUG] Final values — "
+            f"payment_intent_id: {payment.stripe_payment_intent_id}, "
+            f"payment_method: {payment.payment_method}, "
+            f"country: {payment.country}, "
+            f"invoice_id: {payment.stripe_invoice_id}"
+        )
+
+    except stripe.error.StripeError as e:
+        logger.warning(f"Stripe error fetching subscription {stripe_subscription_id}: {str(e)}")
+
+    # ── Activate payment ──────────────────────────────────────────────────
     payment.status = "success"
     payment.paid_at = now()
     payment.save()
 
-    sub = payment.subscription
-
-    # Activate Subscription
+    # ── Activate subscription ─────────────────────────────────────────────
     sub.plan = plan
     sub.status = "active"
+    sub.stripe_subscription_id = stripe_subscription_id
     sub.start_date = now().date()
+    sub.current_period_start = current_period_start
+    sub.current_period_end = current_period_end
 
     if plan.interval == "monthly":
         sub.end_date = sub.start_date + timedelta(days=30)
-    else:
-        # Defaults to yearly
+    elif plan.interval == "yearly":
         sub.end_date = sub.start_date + timedelta(days=365)
 
     sub.last_payment = payment
     sub.save()
 
-    # Create Invoice safely
+    _create_invoice_for_payment(payment, plan)
+
+    logger.info(
+        f"Subscription {sub.id} activated for user {sub.user_id} "
+        f"on plan '{plan.name}' | period: {current_period_start} → {current_period_end}"
+    )
+    return True, "Subscription activated"
+
+def _create_invoice_for_payment(payment, plan):
+    # ── Remove the duplicate block — only one copy of this function ───────
+    logger = logging.getLogger(__name__)
+
+    if Invoice.objects.filter(payment=payment).exists():
+        return
+
+    sub = payment.subscription
+
     try:
-        Invoice.objects.get_or_create(
+        invoice_number = f"INV-{now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+        Invoice.objects.create(
+            subscription=sub,
             payment=payment,
-            defaults={
-                'subscription': sub,
-                'base_amount': payment.base_amount,
-                'discount_amount': payment.discount_amount,
-                'gst_amount': payment.gst_amount,
-                'total_amount': payment.final_amount,
-                'currency': payment.currency,
-                'plan_name': plan.name,
-                'plan_interval': plan.interval,
-                'stripe_payment_intent_id': payment_intent_id,
-                'status': 'paid',
-                'invoice_number': f"INV-{payment.id}-{int(now().timestamp())}"
+            stripe_payment_intent_id=payment.stripe_payment_intent_id,
+            stripe_invoice_id=payment.stripe_invoice_id,
+            base_amount=payment.base_amount,
+            plan_name=plan.name,
+            plan_interval=plan.interval,
+            invoice_number=invoice_number,
+            coupon_code=payment.coupon_code,
+            discount_amount=payment.discount_amount,
+            gst_amount=payment.gst_amount,
+            total_amount=payment.final_amount,
+            currency=payment.currency,
+            status='paid',
+            billing_details={
+                "country": payment.country or "",
+                "payment_method": payment.payment_method or "",
             }
         )
     except Exception as e:
-        logger.error(f"Invoice creation failed for Payment {payment.id}: {str(e)}", exc_info=True)
-        # Even if Invoice creation fails, the core subscription continues processing
-        # Though `atomic()` handles rollback if we let the exception bubble up.
-        raise Exception(f"Invoice creation failed: {str(e)}")
-
-    return True, "Subscription activated successfully"
+        logger.error(
+            f"Failed to create invoice for payment {payment.id}: {str(e)}",
+            exc_info=True
+        )

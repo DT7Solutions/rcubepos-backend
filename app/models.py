@@ -307,13 +307,18 @@ class PlanPricing(models.Model):
 class Subscription(models.Model):
     STATUS_CHOICES = [
         ('active', 'Active'),
-        ('expired', 'Expired'),
-        ('none', 'None')
+        ('past_due', 'Past Due'),
+        ('cancelled', 'Cancelled'),
+        ('incomplete', 'Incomplete'),
+        ('trialing', 'Trialing'),
+        ('none', 'None'),
     ]
 
     restaurant = models.OneToOneField(Restaurant, on_delete=models.CASCADE, related_name='subscription', null=True, blank=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='subscriptions')
     plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True)
+
+    stripe_subscription_id = models.CharField(max_length=255, null=True, blank=True)
 
     last_session_created_at = models.DateTimeField(blank=True, null=True)
     last_payment = models.ForeignKey('PaymentTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='subscriptions')
@@ -323,6 +328,9 @@ class Subscription(models.Model):
     start_date = models.DateField(null=True, blank=True)
     end_date = models.DateField(null=True, blank=True)
 
+    current_period_start = models.DateTimeField(null=True, blank=True)
+    current_period_end = models.DateTimeField(null=True, blank=True)
+
     # Audit fields
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -330,20 +338,13 @@ class Subscription(models.Model):
     history = HistoricalRecords()
 
     def get_status(self):
-        if not self.plan:
-            return 'none'
-        if self.end_date and self.end_date < now().date():
-            return 'expired'
-        return 'active'
+        return self.status
 
     class Meta:
         db_table = 'subscriptions'
         indexes = [
             models.Index(fields=['restaurant']),
             models.Index(fields=['status']),
-        ]
-        constraints = [
-            models.UniqueConstraint(fields=['user'], name='unique_user_subscription')
         ]
 
 class Invoice(models.Model):
@@ -356,6 +357,7 @@ class Invoice(models.Model):
     subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='invoices')
 
     stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
+    stripe_invoice_id = models.CharField(max_length=255, null=True, blank=True)
     
     date = models.DateField(auto_now_add=True)
     base_amount = models.DecimalField(max_digits=10, decimal_places=2)
@@ -414,6 +416,7 @@ class PaymentTransaction(models.Model):
     # Stripe Data
     stripe_session_id = models.CharField(max_length=255, blank=True, null=True)
     stripe_payment_intent_id = models.CharField(max_length=255, blank=True, null=True)
+    stripe_invoice_id = models.CharField(max_length=255, null=True, blank=True)
 
     country = models.CharField(max_length=2, blank=True, null=True)
     currency = models.CharField(max_length=10, default='INR')
