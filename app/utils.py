@@ -374,6 +374,119 @@ def create_checkout_session(user, plan, pricing, subscription):
             exc_info=True
         )
         raise
+def extract_stripe_payment_details(invoice_id, logger):
+    """
+    Given a Stripe Invoice ID, fetch the invoice and extract payment details.
+
+    In Stripe SDK v15 (API 2026-03-25.dahlia), Invoice.payment_intent and
+    Invoice.charge were REMOVED. Payment data now lives under:
+        invoice.payments.data[i].payment.payment_intent
+
+    Returns a dict with:
+      - stripe_invoice_id
+      - stripe_payment_intent_id
+      - payment_method  (type string, e.g. 'card')
+      - billing_country
+      - current_period_start  (datetime, UTC)
+      - current_period_end    (datetime, UTC)
+    """
+    from datetime import datetime, timezone as dt_timezone
+
+    result = {
+        "stripe_invoice_id": None,
+        "stripe_payment_intent_id": None,
+        "payment_method": None,
+        "billing_country": None,
+        "current_period_start": None,
+        "current_period_end": None,
+    }
+
+    if not invoice_id:
+        logger.warning("[extract] No invoice_id provided — skipping extraction")
+        return result
+
+    # ── 1. Fetch the Invoice with the v15 payments expansion ──────────────
+    try:
+        inv = stripe.Invoice.retrieve(
+            invoice_id,
+            expand=["payments.data.payment.payment_intent"],
+        )
+    except stripe.error.StripeError as e:
+        logger.warning(f"[extract] Failed to fetch invoice {invoice_id}: {str(e)}")
+        return result
+
+    result["stripe_invoice_id"] = inv.id
+    logger.info(f"[extract] Invoice fetched: {inv.id}")
+
+    # ── 2. Billing period from line items ─────────────────────────────────
+    lines = getattr(inv, "lines", None)
+    if lines and lines.data:
+        period = getattr(lines.data[0], "period", None)
+        if period:
+            result["current_period_start"] = datetime.fromtimestamp(
+                period.start, tz=dt_timezone.utc
+            )
+            result["current_period_end"] = datetime.fromtimestamp(
+                period.end, tz=dt_timezone.utc
+            )
+
+    # ── 3. Extract PaymentIntent from invoice.payments (v15 API) ──────────
+    payments_list = getattr(inv, "payments", None)
+    if not payments_list or not hasattr(payments_list, "data") or not payments_list.data:
+        logger.warning("[extract] No payments found on invoice")
+        return result
+
+    # Take the first payment (standard for single-payment subscriptions)
+    invoice_payment = payments_list.data[0]
+    payment_obj = getattr(invoice_payment, "payment", None)
+
+    if not payment_obj:
+        logger.warning("[extract] invoice_payment.payment is None")
+        return result
+
+    pi = getattr(payment_obj, "payment_intent", None)
+    logger.info(f"[extract] payment.payment_intent type={type(pi)}")
+
+    pi_obj = None
+    if isinstance(pi, str):
+        result["stripe_payment_intent_id"] = pi
+        try:
+            pi_obj = stripe.PaymentIntent.retrieve(pi)
+        except stripe.error.StripeError as e:
+            logger.warning(f"[extract] PaymentIntent.retrieve({pi}) failed: {str(e)}")
+    elif pi and hasattr(pi, "id"):
+        result["stripe_payment_intent_id"] = pi.id
+        pi_obj = pi
+
+    # ── 4. Extract payment_method from the PaymentIntent ──────────────────
+    if pi_obj:
+        pm_raw = getattr(pi_obj, "payment_method", None)
+        logger.info(f"[extract] pi.payment_method type={type(pm_raw)}")
+
+        if isinstance(pm_raw, str):
+            # payment_method is a string ID — fetch the full object
+            try:
+                pm_obj = stripe.PaymentMethod.retrieve(pm_raw)
+                result["payment_method"] = getattr(pm_obj, "type", None)
+                billing = getattr(pm_obj, "billing_details", None)
+                address = getattr(billing, "address", None) if billing else None
+                result["billing_country"] = getattr(address, "country", None) if address else None
+            except stripe.error.StripeError as e:
+                logger.warning(f"[extract] PaymentMethod.retrieve({pm_raw}) failed: {str(e)}")
+        elif pm_raw and hasattr(pm_raw, "type"):
+            # payment_method is an expanded object
+            result["payment_method"] = pm_raw.type
+            billing = getattr(pm_raw, "billing_details", None)
+            address = getattr(billing, "address", None) if billing else None
+            result["billing_country"] = getattr(address, "country", None) if address else None
+
+    logger.info(
+        f"[extract] Final → pi={result['stripe_payment_intent_id']}, "
+        f"pm={result['payment_method']}, country={result['billing_country']}, "
+        f"invoice={result['stripe_invoice_id']}"
+    )
+    return result
+
 
 def process_initial_subscription(payment, plan, session):
     from datetime import datetime, timezone as dt_timezone
@@ -394,106 +507,39 @@ def process_initial_subscription(payment, plan, session):
     if not sub:
         raise Exception(f"Payment {payment.id} has no linked Subscription record")
 
-    current_period_start = None
-    current_period_end = None
+    # ── Get the invoice ID from the session ────────────────────────────────
+    # By the time checkout.session.completed fires, session.invoice is populated.
+    raw_invoice = getattr(session, "invoice", None)
+    invoice_id = raw_invoice if isinstance(raw_invoice, str) else (
+        raw_invoice.id if raw_invoice and hasattr(raw_invoice, "id") else None
+    )
 
-    try:
-        stripe_sub_obj = stripe.Subscription.retrieve(
-            stripe_subscription_id,
-            expand=[
-                "latest_invoice.payment_intent.payment_method",
-                "latest_invoice.charge",
-            ]
-        )
+    # Fallback: fetch from the Stripe Subscription if session didn't have it
+    if not invoice_id:
+        logger.info(f"[initial] session.invoice was empty, fetching from Subscription")
+        try:
+            stripe_sub_obj = stripe.Subscription.retrieve(stripe_subscription_id)
+            li = getattr(stripe_sub_obj, "latest_invoice", None)
+            invoice_id = li if isinstance(li, str) else (
+                li.id if li and hasattr(li, "id") else None
+            )
+        except stripe.error.StripeError as e:
+            logger.warning(f"[initial] Subscription.retrieve failed: {str(e)}")
 
-        latest_invoice = getattr(stripe_sub_obj, "latest_invoice", None)
+    logger.info(f"[initial] Resolved invoice_id: {invoice_id}")
 
-        # ── DEBUG: log the raw structure so we can see what Stripe returns ─
-        logger.info(f"[DEBUG] stripe_subscription_id: {stripe_subscription_id}")
-        logger.info(f"[DEBUG] latest_invoice: {latest_invoice.id if latest_invoice else None}")
+    # ── Extract all payment details from the Invoice ───────────────────────
+    details = extract_stripe_payment_details(invoice_id, logger)
 
-        if latest_invoice:
-            payment.stripe_invoice_id = latest_invoice.id
+    # Apply extracted details to the payment record
+    payment.stripe_invoice_id = details["stripe_invoice_id"]
+    payment.stripe_payment_intent_id = details["stripe_payment_intent_id"]
+    payment.payment_method = details["payment_method"]
+    if details["billing_country"] and not payment.country:
+        payment.country = details["billing_country"]
 
-            # Log payment_intent raw value BEFORE any processing
-            raw_pi = getattr(latest_invoice, "payment_intent", None)
-            logger.info(f"[DEBUG] raw payment_intent type: {type(raw_pi)}, value: {raw_pi}")
-
-            # Log charge raw value
-            raw_charge = getattr(latest_invoice, "charge", None)
-            logger.info(f"[DEBUG] raw charge type: {type(raw_charge)}, value: {raw_charge}")
-
-            # ── Billing period ────────────────────────────────────────────
-            lines = getattr(latest_invoice, "lines", None)
-            if lines and lines.data:
-                period = getattr(lines.data[0], "period", None)
-                if period:
-                    current_period_start = datetime.fromtimestamp(
-                        period.start, tz=dt_timezone.utc
-                    )
-                    current_period_end = datetime.fromtimestamp(
-                        period.end, tz=dt_timezone.utc
-                    )
-
-            # ── PaymentIntent ─────────────────────────────────────────────
-            pi = raw_pi
-            if pi and hasattr(pi, "id"):
-                payment.stripe_payment_intent_id = pi.id
-                logger.info(f"[DEBUG] PI id: {pi.id}")
-
-                pm = getattr(pi, "payment_method", None)
-                logger.info(f"[DEBUG] pm type: {type(pm)}, value: {pm}")
-
-                if pm and not isinstance(pm, str):
-                    payment.payment_method = getattr(pm, "type", None)
-                    logger.info(f"[DEBUG] pm.type (expanded): {payment.payment_method}")
-
-                    billing = getattr(pm, "billing_details", None)
-                    address = getattr(billing, "address", None) if billing else None
-                    country = getattr(address, "country", None) if address else None
-                    if country and not payment.country:
-                        payment.country = country
-
-                elif pm and isinstance(pm, str):
-                    logger.info(f"[DEBUG] pm was a string ID, fetching separately: {pm}")
-                    try:
-                        pm_obj = stripe.PaymentMethod.retrieve(pm)
-                        payment.payment_method = getattr(pm_obj, "type", None)
-                        logger.info(f"[DEBUG] pm.type (fetched): {payment.payment_method}")
-                    except stripe.error.StripeError as e:
-                        logger.warning(f"[DEBUG] PaymentMethod fetch failed: {str(e)}")
-
-                else:
-                    logger.info(f"[DEBUG] pm is None or falsy — no payment method on PI")
-
-            else:
-                logger.info(f"[DEBUG] PI is None or has no id — skipping PI block")
-
-            # ── Fallback via charge ───────────────────────────────────────
-            if not payment.payment_method:
-                logger.info(f"[DEBUG] payment_method still empty, trying charge fallback")
-                charge = raw_charge
-                if charge and not isinstance(charge, str):
-                    pmd = getattr(charge, "payment_method_details", None)
-                    logger.info(f"[DEBUG] charge.payment_method_details: {pmd}")
-                    if pmd:
-                        payment.payment_method = getattr(pmd, "type", None)
-                        logger.info(f"[DEBUG] pmd.type: {payment.payment_method}")
-                elif charge and isinstance(charge, str):
-                    logger.info(f"[DEBUG] charge was a string ID (not expanded): {charge}")
-                else:
-                    logger.info(f"[DEBUG] charge is None")
-
-        logger.info(
-            f"[DEBUG] Final values — "
-            f"payment_intent_id: {payment.stripe_payment_intent_id}, "
-            f"payment_method: {payment.payment_method}, "
-            f"country: {payment.country}, "
-            f"invoice_id: {payment.stripe_invoice_id}"
-        )
-
-    except stripe.error.StripeError as e:
-        logger.warning(f"Stripe error fetching subscription {stripe_subscription_id}: {str(e)}")
+    current_period_start = details["current_period_start"]
+    current_period_end = details["current_period_end"]
 
     # ── Activate payment ──────────────────────────────────────────────────
     payment.status = "success"
@@ -516,7 +562,7 @@ def process_initial_subscription(payment, plan, session):
     sub.last_payment = payment
     sub.save()
 
-    _create_invoice_for_payment(payment, plan)
+    create_invoice_for_payment(payment, plan)
 
     logger.info(
         f"Subscription {sub.id} activated for user {sub.user_id} "
@@ -524,7 +570,7 @@ def process_initial_subscription(payment, plan, session):
     )
     return True, "Subscription activated"
 
-def _create_invoice_for_payment(payment, plan):
+def create_invoice_for_payment(payment, plan):
     # ── Remove the duplicate block — only one copy of this function ───────
     logger = logging.getLogger(__name__)
 

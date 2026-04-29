@@ -1469,9 +1469,13 @@ class StripeWebhookView(APIView):
         if not stripe_sub_id:
             return
 
+        # Normalise to string ID
+        if not isinstance(stripe_sub_id, str):
+            stripe_sub_id = stripe_sub_id.id if hasattr(stripe_sub_id, "id") else str(stripe_sub_id)
+
         sub = Subscription.objects.filter(
             stripe_subscription_id=stripe_sub_id
-        ).first()
+        ).select_related("plan", "user").first()
 
         if not sub:
             logger.warning(
@@ -1480,33 +1484,94 @@ class StripeWebhookView(APIView):
             )
             return
 
+        # ── Get the Stripe invoice ID ─────────────────────────────────────
+        stripe_invoice_id = invoice.id if hasattr(invoice, "id") else None
+
+        if not stripe_invoice_id:
+            logger.warning("invoice.payment_succeeded: invoice has no id — skipping")
+            return
+
+        # ── Skip if this invoice was already processed (initial checkout) ──
+        if PaymentTransaction.objects.filter(stripe_invoice_id=stripe_invoice_id).exists():
+            logger.info(
+                f"invoice.payment_succeeded: invoice {stripe_invoice_id} already has a "
+                f"PaymentTransaction — skipping (likely initial checkout)"
+            )
+            # Still update period dates in case webhook arrived slightly out of order
+            try:
+                lines = getattr(invoice, "lines", None)
+                if lines and lines.data:
+                    period = getattr(lines.data[0], "period", None)
+                    if period:
+                        sub.current_period_start = datetime.fromtimestamp(
+                            period.start, tz=dt_timezone.utc
+                        )
+                        sub.current_period_end = datetime.fromtimestamp(
+                            period.end, tz=dt_timezone.utc
+                        )
+                        sub.status = "active"
+                        sub.save(update_fields=[
+                            "current_period_start",
+                            "current_period_end",
+                            "status"
+                        ])
+            except Exception as e:
+                logger.warning(f"Period update failed for existing invoice: {str(e)}")
+            return
+
+        # ── Extract payment details via shared helper ─────────────────────
+        details = extract_stripe_payment_details(stripe_invoice_id, logger)
+
+        # ── Determine amounts from the Stripe invoice ─────────────────────
+        # amount_paid is in the smallest currency unit (e.g. paise for INR)
+        amount_paid_raw = getattr(invoice, "amount_paid", 0) or 0
+        currency = getattr(invoice, "currency", "usd") or "usd"
+
+        # Stripe stores amounts in smallest units; convert to decimal
+        from decimal import Decimal
+        base_amount = Decimal(amount_paid_raw) / Decimal(100)
+
         try:
-            lines = getattr(invoice, "lines", None)
-            if not lines or not lines.data:
-                logger.warning(f"Invoice {invoice.id} has no line items — skipping period update")
-                return
-
-            period = getattr(lines.data[0], "period", None)
-            if not period:
-                logger.warning(f"Invoice {invoice.id} line has no period — skipping")
-                return
-
-            sub.current_period_start = datetime.fromtimestamp(
-                period.start, tz=dt_timezone.utc
+            # ── Create PaymentTransaction for this recurring charge ────────
+            payment = PaymentTransaction.objects.create(
+                user=sub.user,
+                subscription=sub,
+                base_amount=base_amount,
+                currency=currency.upper(),
+                country=details["billing_country"] or getattr(sub.user, "billing_country", None) or "",
+                stripe_invoice_id=details["stripe_invoice_id"],
+                stripe_payment_intent_id=details["stripe_payment_intent_id"],
+                payment_method=details["payment_method"],
+                status="success",
+                paid_at=now(),
             )
-            sub.current_period_end = datetime.fromtimestamp(
-                period.end, tz=dt_timezone.utc
+
+            logger.info(
+                f"invoice.payment_succeeded: created PaymentTransaction {payment.id} "
+                f"for subscription {sub.id} (invoice {stripe_invoice_id})"
             )
+
+            # ── Update subscription ───────────────────────────────────────
             sub.status = "active"
+            sub.last_payment = payment
+            if details["current_period_start"]:
+                sub.current_period_start = details["current_period_start"]
+            if details["current_period_end"]:
+                sub.current_period_end = details["current_period_end"]
             sub.save(update_fields=[
+                "status",
+                "last_payment",
                 "current_period_start",
                 "current_period_end",
-                "status"
             ])
+
+            # ── Create local Invoice ──────────────────────────────────────
+            if sub.plan:
+                create_invoice_for_payment(payment, sub.plan)
 
         except Exception as e:
             # Re-raise so the webhook handler logs it and returns 500 for retry
-            raise Exception(f"Failed to update subscription periods: {str(e)}")
+            raise Exception(f"Failed to process recurring invoice {stripe_invoice_id}: {str(e)}")
 
     def handle_invoice_payment_failed(self, invoice):
         stripe_sub_id = getattr(invoice, "subscription", None)
