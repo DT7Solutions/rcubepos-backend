@@ -335,6 +335,10 @@ class Subscription(models.Model):
     current_period_start = models.DateTimeField(null=True, blank=True)
     current_period_end = models.DateTimeField(null=True, blank=True)
 
+    # Cancellation fields
+    cancel_at_period_end = models.BooleanField(default=False)
+    cancel_at = models.DateTimeField(null=True, blank=True)
+
     # Audit fields
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

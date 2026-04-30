@@ -302,6 +302,8 @@ class OwnerSubscriptionSerializer(serializers.ModelSerializer):
             'plan_name',
             'start_date',
             'end_date',
+            'cancel_at_period_end',
+            'cancel_at',
             'invoices',
         ]
 

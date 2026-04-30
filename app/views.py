@@ -11,6 +11,7 @@ from rest_framework import status
 
 from django.contrib.auth import authenticate, get_user_model
 from django.conf import settings
+from django.core.signing import dumps, loads, SignatureExpired, BadSignature
 from django.http import HttpResponse
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -688,8 +689,6 @@ class ChangePasswordView(APIView):
 
         return Response({"message": "Password updated successfully"}, status=200)
     
-from django.core.signing import dumps, loads, SignatureExpired, BadSignature
-
 class ForgotPasswordView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -1143,6 +1142,267 @@ class MySubscriptionView(APIView):
         sub_data["payments"] = PaymentTransactionSerializer(payments, many=True).data
 
         return Response(sub_data)
+
+class CancelSubscriptionView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        """
+        Cancel the user's active subscription.
+        
+        Body: { "immediately": false }  ← optional, defaults to false (cancel at period end)
+        """
+        user = request.user
+        immediately = request.data.get("immediately", False)
+
+        sub = Subscription.objects.filter(
+            user=user,
+            status="active"
+        ).first()
+
+        if not sub:
+            return Response(
+                {"error": "No active subscription found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if not sub.stripe_subscription_id:
+            return Response(
+                {"error": "Subscription has no Stripe reference — contact support"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if sub.cancel_at_period_end and not immediately:
+            return Response(
+                {
+                    "message": "Subscription is already scheduled to cancel",
+                    "cancel_at": sub.cancel_at
+                },
+                status=status.HTTP_200_OK
+            )
+
+        try:
+            if immediately:
+                # Cancel right now — no refund, access lost immediately
+                stripe.Subscription.cancel(sub.stripe_subscription_id)
+
+                sub.status = "cancelled"
+                sub.cancel_at_period_end = False
+                sub.cancel_at = None
+                sub.save(update_fields=["status", "cancel_at_period_end", "cancel_at"])
+
+                logger.info(f"Subscription {sub.id} cancelled immediately for user {user.id}")
+
+                return Response(
+                    {"message": "Subscription cancelled immediately"},
+                    status=status.HTTP_200_OK
+                )
+
+            else:
+                # Cancel at period end — user keeps access until current period ends
+                updated = stripe.Subscription.modify(
+                    sub.stripe_subscription_id,
+                    cancel_at_period_end=True
+                )
+
+                from datetime import datetime, timezone as dt_timezone
+                cancel_at = getattr(updated, "cancel_at", None)
+
+                sub.cancel_at_period_end = True
+                sub.cancel_at = (
+                    datetime.fromtimestamp(cancel_at, tz=dt_timezone.utc)
+                    if cancel_at else None
+                )
+                sub.save(update_fields=["cancel_at_period_end", "cancel_at"])
+
+                logger.info(
+                    f"Subscription {sub.id} scheduled to cancel at period end "
+                    f"({sub.cancel_at}) for user {user.id}"
+                )
+
+                return Response(
+                    {
+                        "message": "Subscription will cancel at the end of the current period",
+                        "cancel_at": sub.cancel_at,
+                        "access_until": sub.current_period_end
+                    },
+                    status=status.HTTP_200_OK
+                )
+
+        except stripe.error.StripeError as e:
+            logger.error(
+                f"Stripe error cancelling subscription {sub.stripe_subscription_id}: {str(e)}"
+            )
+            return Response(
+                {"error": "Failed to cancel subscription. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+
+class ReactivateSubscriptionView(APIView):
+    """
+    Undo a scheduled cancellation (cancel_at_period_end=True → False).
+    Only works before the period actually ends.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+
+        sub = Subscription.objects.filter(
+            user=user,
+            status="active",
+            cancel_at_period_end=True
+        ).first()
+
+        if not sub:
+            return Response(
+                {"error": "No subscription scheduled for cancellation found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        try:
+            stripe.Subscription.modify(
+                sub.stripe_subscription_id,
+                cancel_at_period_end=False
+            )
+
+            sub.cancel_at_period_end = False
+            sub.cancel_at = None
+            sub.save(update_fields=["cancel_at_period_end", "cancel_at"])
+
+            logger.info(f"Subscription {sub.id} reactivated for user {user.id}")
+
+            return Response(
+                {"message": "Subscription reactivated successfully"},
+                status=status.HTTP_200_OK
+            )
+
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe error reactivating subscription: {str(e)}")
+            return Response(
+                {"error": "Failed to reactivate subscription"},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+
+class UpgradeSubscriptionView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        """
+        Upgrade or downgrade the user's active subscription to a new plan.
+        Stripe handles proration automatically.
+        
+        Body: { "plan_id": 3 }
+        """
+        user = request.user
+        plan_id = request.data.get("plan_id")
+
+        if not plan_id:
+            return Response(
+                {"error": "plan_id is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        sub = Subscription.objects.filter(
+            user=user,
+            status="active"
+        ).select_related("plan").first()
+
+        if not sub:
+            return Response(
+                {"error": "No active subscription found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if not sub.stripe_subscription_id:
+            return Response(
+                {"error": "Subscription has no Stripe reference — contact support"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate new plan
+        try:
+            new_plan = SubscriptionPlan.objects.get(id=int(plan_id), is_active=True)
+        except (SubscriptionPlan.DoesNotExist, ValueError):
+            return Response(
+                {"error": "Invalid or inactive plan"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if sub.plan and sub.plan.id == new_plan.id:
+            return Response(
+                {"error": "You are already on this plan"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Get correct pricing for user's country
+        country = user.billing_country or "US"
+        pricing = get_plan_pricing(new_plan, country)
+
+        if not pricing or not pricing.stripe_price_id:
+            return Response(
+                {"error": f"No pricing available for plan in country '{country}'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # Fetch current subscription to get the subscription item ID
+            stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id)
+            
+            if not stripe_sub.items.data:
+                return Response(
+                    {"error": "Could not find subscription items on Stripe"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            subscription_item_id = stripe_sub.items.data[0].id
+
+            # Modify the subscription with the new price
+            # proration_behavior='create_prorations' charges/credits the difference immediately
+            stripe.Subscription.modify(
+                sub.stripe_subscription_id,
+                items=[{
+                    "id": subscription_item_id,
+                    "price": pricing.stripe_price_id,
+                }],
+                proration_behavior="create_prorations",
+            )
+
+            # Update local plan immediately — webhook will also confirm via
+            # handle_subscription_updated but we update optimistically here
+            old_plan_name = sub.plan.name if sub.plan else "none"
+            sub.plan = new_plan
+            sub.cancel_at_period_end = False  # upgrading removes any pending cancellation
+            sub.cancel_at = None
+            sub.save(update_fields=["plan", "cancel_at_period_end", "cancel_at"])
+
+            logger.info(
+                f"Subscription {sub.id} upgraded: {old_plan_name} → {new_plan.name} "
+                f"for user {user.id}"
+            )
+
+            return Response(
+                {
+                    "message": f"Successfully upgraded to {new_plan.name}",
+                    "plan": new_plan.name,
+                    "interval": new_plan.interval,
+                    "country": pricing.country,
+                    "currency": pricing.currency,
+                },
+                status=status.HTTP_200_OK
+            )
+
+        except stripe.error.StripeError as e:
+            logger.error(
+                f"Stripe error upgrading subscription {sub.stripe_subscription_id}: {str(e)}"
+            )
+            return Response(
+                {"error": "Failed to upgrade subscription. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
 
 class SubscriptionPlanViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.AllowAny]
@@ -1717,21 +1977,18 @@ class StripeWebhookView(APIView):
             )
 
     def handle_subscription_updated(self, subscription):
-        """
-        Fired by Stripe whenever a subscription changes status.
-        Keeps our local status in sync with Stripe's source of truth.
-        """
+        from datetime import datetime, timezone as dt_timezone
+
         stripe_sub_id = subscription.id
         stripe_status = getattr(subscription, "status", None)
 
         if not stripe_status:
             return
 
-        # Map Stripe statuses to our local statuses
         STATUS_MAP = {
             "active": "active",
             "past_due": "past_due",
-            "unpaid": "past_due",       # treat unpaid same as past_due
+            "unpaid": "past_due",
             "canceled": "cancelled",
             "incomplete": "incomplete",
             "incomplete_expired": "cancelled",
@@ -1741,26 +1998,56 @@ class StripeWebhookView(APIView):
 
         local_status = STATUS_MAP.get(stripe_status)
         if not local_status:
-            logger.warning(
-                f"customer.subscription.updated: unknown Stripe status "
-                f"'{stripe_status}' for {stripe_sub_id}"
-            )
+            logger.warning(f"customer.subscription.updated: unknown status '{stripe_status}'")
             return
 
-        updated = Subscription.objects.filter(
+        sub = Subscription.objects.filter(
             stripe_subscription_id=stripe_sub_id
-        ).update(status=local_status)
+        ).select_related("plan").first()
 
-        if not updated:
-            logger.warning(
-                f"customer.subscription.updated: no subscription found "
-                f"for stripe_subscription_id={stripe_sub_id}"
-            )
+        if not sub:
+            logger.warning(f"customer.subscription.updated: no subscription for {stripe_sub_id}")
+            return
+
+        update_fields = ["status"]
+        sub.status = local_status
+
+        # Sync cancel_at_period_end state
+        cancel_at_period_end = getattr(subscription, "cancel_at_period_end", False)
+        sub.cancel_at_period_end = cancel_at_period_end
+        update_fields.append("cancel_at_period_end")
+
+        cancel_at = getattr(subscription, "cancel_at", None)
+        if cancel_at:
+            sub.cancel_at = datetime.fromtimestamp(cancel_at, tz=dt_timezone.utc)
         else:
-            logger.info(
-                f"Subscription {stripe_sub_id} status synced to '{local_status}' "
-                f"from Stripe status '{stripe_status}'"
-            )
+            sub.cancel_at = None
+        update_fields.append("cancel_at")
+
+        # Sync plan if price changed (upgrade/downgrade)
+        try:
+            items = getattr(subscription, "items", None)
+            if items and items.data:
+                stripe_price_id = items.data[0].price.id
+                pricing = PlanPricing.objects.select_related("plan").filter(
+                    stripe_price_id=stripe_price_id
+                ).first()
+                if pricing and pricing.plan != sub.plan:
+                    logger.info(
+                        f"Plan changed for subscription {stripe_sub_id}: "
+                        f"{sub.plan} → {pricing.plan}"
+                    )
+                    sub.plan = pricing.plan
+                    update_fields.append("plan")
+        except Exception as e:
+            logger.warning(f"customer.subscription.updated: plan sync failed: {str(e)}")
+
+        sub.save(update_fields=update_fields)
+
+        logger.info(
+            f"Subscription {stripe_sub_id} synced — "
+            f"status={local_status} cancel_at_period_end={cancel_at_period_end}"
+        )
 
 @method_decorator(csrf_exempt, name='dispatch')
 class VerifyPaymentView(APIView):
