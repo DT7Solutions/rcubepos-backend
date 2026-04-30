@@ -9,7 +9,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework import status
 
-from django.contrib.auth import authenticate
+from django.contrib.auth import authenticate, get_user_model
 from django.conf import settings
 from django.http import HttpResponse
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -48,6 +48,7 @@ from .permissions import *
 logger = logging.getLogger(__name__)
 
 # Create your views here.
+User = get_user_model()
 
 # ========================= # AUTH VIEWS # =========================
 
@@ -792,7 +793,8 @@ class AdminUserViewSet(viewsets.ModelViewSet):
         if not self.request.user.is_staff:
             raise PermissionDenied("Only admin can access users.")
 
-        return User.objects.filter(is_staff=False)
+        # Display newest users first and only those who are not staff
+        return User.objects.filter(is_staff=False).order_by('-created_at')
 
     # ================= CREATE =================
     def create(self, request):
@@ -808,23 +810,49 @@ class AdminUserViewSet(viewsets.ModelViewSet):
         if not email or not name:
             raise ValidationError("Name and email are required.")
 
-        user = User.objects.create_user(
-            email=email,
-            username=email,
-            phone=phone or "",
-            password=password,
-        )
-        user.first_name = name
-        user.save()
+        # Manager requires phone, but the model allows blank. 
+        # If no phone is provided, we use a placeholder or handle the manager's requirement.
+        # However, it's better to ensure a valid phone or adjust the manager.
+        # For now, let's ensure phone is not None for the create_user call.
+        if not phone:
+            # If phone is not provided, we might have a problem if it's required by manager.
+            # Let's check if we can pass a dummy one or if it's better to just require it.
+            raise ValidationError("Phone number is required.")
 
-        # Create restaurant
-        if restaurant_name:
-            Restaurant.objects.create(
-                name=restaurant_name,
-                owner=user
-            )
+        if User.objects.filter(email=email).exists():
+            raise ValidationError("User with this email already exists.")
 
-        return Response(AdminUserSerializer(user).data, status=201)
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    email=email,
+                    username=email,
+                    phone=phone,
+                    password=password,
+                )
+                user.first_name = name
+                
+                # Assign 'owner' role
+                try:
+                    owner_role = Role.objects.get(role_category='owner')
+                    user.role = owner_role
+                except Role.DoesNotExist:
+                    pass # Or handle error
+                
+                user.save()
+
+                # Create restaurant
+                if restaurant_name:
+                    Restaurant.objects.create(
+                        name=restaurant_name,
+                        owner=user,
+                        phone=phone, # Copy phone to restaurant
+                        address="Not provided" # Required by model
+                    )
+
+                return Response(AdminUserSerializer(user).data, status=201)
+        except Exception as e:
+            raise ValidationError(str(e))
 
     # ================= SOFT DELETE =================
     def destroy(self, request, *args, **kwargs):
@@ -1482,6 +1510,17 @@ class StripeWebhookView(APIView):
                 raise Exception(
                     f"Payment {payment.id} has no linked Subscription"
                 )
+            
+            stripe_customer_id = getattr(session, 'customer', None)
+            if stripe_customer_id and isinstance(stripe_customer_id, str):
+                if not sub.user.stripe_customer_id:
+                    Users.objects.filter(id=sub.user_id).update(
+                        stripe_customer_id=stripe_customer_id
+                    )
+                    logger.info(
+                        f"Synced Stripe Customer {stripe_customer_id} "
+                        f"to user {sub.user_id} via webhook"
+                    )
 
             # Integrity check: metadata user must match subscription owner
             if str(user_id) != str(sub.user_id):
@@ -1500,101 +1539,107 @@ class StripeWebhookView(APIView):
             process_initial_subscription(payment, plan, session)
 
     def handle_invoice_payment_success(self, invoice):
+        from decimal import Decimal
         from datetime import datetime, timezone as dt_timezone
 
-        stripe_sub_id = getattr(invoice, "subscription", None)
+        logger.info(f"[renewal] invoice.payment_succeeded fired — invoice.id={getattr(invoice, 'id', None)}")
+
+        # invoice.subscription removed in Stripe API 2026-03-25.dahlia
+        # Now lives at invoice.parent.subscription_details.subscription
+        stripe_sub_id = None
+        try:
+            stripe_sub_id = invoice.parent.subscription_details.subscription
+        except AttributeError:
+            pass
+
         if not stripe_sub_id:
+            logger.warning(f"[renewal] Could not resolve subscription ID from invoice {getattr(invoice, 'id', None)} — skipping")
             return
 
-        # Normalise to string ID
         if not isinstance(stripe_sub_id, str):
             stripe_sub_id = stripe_sub_id.id if hasattr(stripe_sub_id, "id") else str(stripe_sub_id)
+
+        logger.info(f"[renewal] Resolved stripe_sub_id={stripe_sub_id}")
 
         sub = Subscription.objects.filter(
             stripe_subscription_id=stripe_sub_id
         ).select_related("plan", "user").first()
 
         if not sub:
-            logger.warning(
-                f"invoice.payment_succeeded: no subscription found "
-                f"for stripe_subscription_id={stripe_sub_id}"
-            )
-            return
-
-        # ── Get the Stripe invoice ID ─────────────────────────────────────
-        stripe_invoice_id = invoice.id if hasattr(invoice, "id") else None
-
-        if not stripe_invoice_id:
-            logger.warning("invoice.payment_succeeded: invoice has no id — skipping")
-            return
-
-        # ── Skip if this invoice was already processed (initial checkout) ──
-        if PaymentTransaction.objects.filter(stripe_invoice_id=stripe_invoice_id).exists():
             logger.info(
-                f"invoice.payment_succeeded: invoice {stripe_invoice_id} already has a "
-                f"PaymentTransaction — skipping (likely initial checkout)"
+                f"[renewal] No local subscription found for stripe_sub_id={stripe_sub_id} "
+                f"— likely initial payment arriving before checkout.session.completed. Skipping."
             )
-            # Still update period dates in case webhook arrived slightly out of order
+            return
+
+        logger.info(f"[renewal] Found local subscription id={sub.id} user={sub.user_id} status={sub.status}")
+
+        stripe_invoice_id = getattr(invoice, "id", None)
+        if not stripe_invoice_id:
+            logger.warning("[renewal] Invoice has no id — skipping")
+            return
+
+        logger.info(f"[renewal] stripe_invoice_id={stripe_invoice_id}")
+
+        if PaymentTransaction.objects.filter(stripe_invoice_id=stripe_invoice_id).exists():
+            logger.info(f"[renewal] Invoice {stripe_invoice_id} already processed — skipping")
             try:
                 lines = getattr(invoice, "lines", None)
                 if lines and lines.data:
                     period = getattr(lines.data[0], "period", None)
                     if period:
-                        sub.current_period_start = datetime.fromtimestamp(
-                            period.start, tz=dt_timezone.utc
-                        )
-                        sub.current_period_end = datetime.fromtimestamp(
-                            period.end, tz=dt_timezone.utc
-                        )
+                        sub.current_period_start = datetime.fromtimestamp(period.start, tz=dt_timezone.utc)
+                        sub.current_period_end = datetime.fromtimestamp(period.end, tz=dt_timezone.utc)
                         sub.status = "active"
-                        sub.save(update_fields=[
-                            "current_period_start",
-                            "current_period_end",
-                            "status"
-                        ])
+                        sub.save(update_fields=["current_period_start", "current_period_end", "status"])
+                        logger.info(f"[renewal] Period dates synced for existing invoice")
             except Exception as e:
-                logger.warning(f"Period update failed for existing invoice: {str(e)}")
+                logger.warning(f"[renewal] Period sync failed: {str(e)}")
             return
 
-        # ── Extract payment details via shared helper ─────────────────────
-        details = extract_stripe_payment_details(stripe_invoice_id, logger)
-
-        # ── Determine amounts from the Stripe invoice ─────────────────────
-        # amount_paid is in the smallest currency unit (e.g. paise for INR)
         amount_paid_raw = getattr(invoice, "amount_paid", 0) or 0
-        currency = getattr(invoice, "currency", "usd") or "usd"
-
-        # Stripe stores amounts in smallest units; convert to decimal
-        from decimal import Decimal
+        currency = (getattr(invoice, "currency", "usd") or "usd").upper()
         base_amount = Decimal(amount_paid_raw) / Decimal(100)
 
+        logger.info(f"[renewal] amount_paid_raw={amount_paid_raw} currency={currency} base_amount={base_amount}")
+
+        current_period_start = None
+        current_period_end = None
         try:
-            # ── Create PaymentTransaction for this recurring charge ────────
+            lines = getattr(invoice, "lines", None)
+            if lines and lines.data:
+                period = getattr(lines.data[0], "period", None)
+                if period:
+                    current_period_start = datetime.fromtimestamp(period.start, tz=dt_timezone.utc)
+                    current_period_end = datetime.fromtimestamp(period.end, tz=dt_timezone.utc)
+                    logger.info(f"[renewal] period {current_period_start} → {current_period_end}")
+                else:
+                    logger.warning("[renewal] No period on first line item")
+            else:
+                logger.warning("[renewal] No line items on invoice")
+        except Exception as e:
+            logger.warning(f"[renewal] Period extraction failed: {str(e)}")
+
+        with transaction.atomic():
             payment = PaymentTransaction.objects.create(
                 user=sub.user,
                 subscription=sub,
                 base_amount=base_amount,
-                currency=currency.upper(),
-                country=details["billing_country"] or getattr(sub.user, "billing_country", None) or "",
-                stripe_invoice_id=details["stripe_invoice_id"],
-                stripe_payment_intent_id=details["stripe_payment_intent_id"],
-                payment_method=details["payment_method"],
+                currency=currency,
+                country=getattr(sub.user, "billing_country", None) or "",
+                stripe_invoice_id=stripe_invoice_id,
                 status="success",
                 paid_at=now(),
             )
 
-            logger.info(
-                f"invoice.payment_succeeded: created PaymentTransaction {payment.id} "
-                f"for subscription {sub.id} (invoice {stripe_invoice_id})"
-            )
+            logger.info(f"[renewal] Created PaymentTransaction id={payment.id}")
 
-            # ── Update subscription ───────────────────────────────────────
             sub.status = "active"
             sub.last_payment = payment
-            if details["current_period_start"]:
-                sub.current_period_start = details["current_period_start"]
-            if details["current_period_end"]:
-                sub.current_period_end = details["current_period_end"]
+            if current_period_start:
+                sub.current_period_start = current_period_start
+            if current_period_end:
+                sub.current_period_end = current_period_end
             sub.save(update_fields=[
                 "status",
                 "last_payment",
@@ -1602,28 +1647,62 @@ class StripeWebhookView(APIView):
                 "current_period_end",
             ])
 
-            # ── Create local Invoice ──────────────────────────────────────
-            if sub.plan:
-                create_invoice_for_payment(payment, sub.plan)
+            logger.info(f"[renewal] Subscription {sub.id} updated — status=active last_payment={payment.id}")
 
+        try:
+            logger.info(f"[renewal] Starting enrichment for invoice {stripe_invoice_id}")
+            details = extract_stripe_payment_details(stripe_invoice_id, logger)
+            updates = {}
+            if details["stripe_payment_intent_id"]:
+                updates["stripe_payment_intent_id"] = details["stripe_payment_intent_id"]
+            if details["payment_method"]:
+                updates["payment_method"] = details["payment_method"]
+            if details["billing_country"]:
+                updates["country"] = details["billing_country"]
+            if updates:
+                PaymentTransaction.objects.filter(id=payment.id).update(**updates)
+                logger.info(f"[renewal] Enriched payment {payment.id} with {list(updates.keys())}")
+            else:
+                logger.warning(f"[renewal] Enrichment returned no data for payment {payment.id}")
         except Exception as e:
-            # Re-raise so the webhook handler logs it and returns 500 for retry
-            raise Exception(f"Failed to process recurring invoice {stripe_invoice_id}: {str(e)}")
+            logger.warning(f"[renewal] Enrichment failed for payment {payment.id}: {str(e)} — transaction still recorded")
+
+        if sub.plan:
+            try:
+                create_invoice_for_payment(payment, sub.plan)
+                logger.info(f"[renewal] Invoice record created for payment {payment.id}")
+            except Exception as e:
+                logger.error(f"[renewal] Invoice creation failed for payment {payment.id}: {str(e)}")
+        else:
+            logger.warning(f"[renewal] sub.plan is None for subscription {sub.id} — no invoice created")
 
     def handle_invoice_payment_failed(self, invoice):
-        stripe_sub_id = getattr(invoice, "subscription", None)
+        logger.info(f"[failed] invoice.payment_failed fired — invoice.id={getattr(invoice, 'id', None)}")
+
+        # invoice.subscription removed in Stripe API 2026-03-25.dahlia
+        stripe_sub_id = None
+        try:
+            stripe_sub_id = invoice.parent.subscription_details.subscription
+        except AttributeError:
+            pass
+
         if not stripe_sub_id:
+            logger.warning(f"[failed] Could not resolve subscription ID from invoice — skipping")
             return
+
+        if not isinstance(stripe_sub_id, str):
+            stripe_sub_id = stripe_sub_id.id if hasattr(stripe_sub_id, "id") else str(stripe_sub_id)
+
+        logger.info(f"[failed] Resolved stripe_sub_id={stripe_sub_id}")
 
         updated = Subscription.objects.filter(
             stripe_subscription_id=stripe_sub_id
         ).update(status="past_due")
 
         if not updated:
-            logger.warning(
-                f"invoice.payment_failed: no subscription found "
-                f"for stripe_subscription_id={stripe_sub_id}"
-            )
+            logger.warning(f"[failed] No subscription found for stripe_sub_id={stripe_sub_id}")
+        else:
+            logger.info(f"[failed] Subscription marked past_due for stripe_sub_id={stripe_sub_id}")
 
     def handle_subscription_deleted(self, subscription):
         updated = Subscription.objects.filter(

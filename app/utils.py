@@ -320,6 +320,41 @@ def get_plan_pricing(plan, country):
 
 # ============================= PAYMENT HELPER FUNCTIONS =============================
 
+stripe.api_key = settings.STRIPE_SECRET_KEY
+
+def get_or_create_stripe_customer(user):
+    if user.stripe_customer_id:
+        try:
+            customer = stripe.Customer.retrieve(user.stripe_customer_id)
+            if getattr(customer, 'deleted', False):
+                raise Exception("Customer deleted on Stripe")
+            logger.info(f"[customer] Reusing existing customer {user.stripe_customer_id} for user {user.id}")
+            return user.stripe_customer_id
+        except Exception as e:
+            logger.warning(
+                f"[customer] Customer {user.stripe_customer_id} invalid for user {user.id}: {str(e)} — creating new"
+            )
+
+    create_kwargs = dict(
+        email=user.email,
+        name=f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username,
+        metadata={"user_id": str(user.id), "app": "RCube-Smart"}
+    )
+
+    # Only attach test clock in non-production environments, and only if configured
+    test_clock_id = getattr(settings, 'STRIPE_TEST_CLOCK_ID', None)
+    if test_clock_id:
+        create_kwargs["test_clock"] = test_clock_id
+        logger.info(f"[customer] Attaching test clock {test_clock_id}")
+
+    customer = stripe.Customer.create(**create_kwargs)
+
+    Users.objects.filter(id=user.id).update(stripe_customer_id=customer.id)
+    user.stripe_customer_id = customer.id
+
+    logger.info(f"[customer] Created Stripe Customer {customer.id} for user {user.id}")
+    return customer.id
+
 def extract_stripe_metadata(stripe_obj) -> dict:
     if not stripe_obj:
         return {}
@@ -329,8 +364,6 @@ def extract_stripe_metadata(stripe_obj) -> dict:
     if isinstance(stripe_obj, dict):
         return stripe_obj
     return {}
-
-stripe.api_key = settings.STRIPE_SECRET_KEY
 
 def create_stripe_product(plan):
     """
@@ -415,11 +448,14 @@ def create_checkout_session(user, plan, pricing, subscription):
             f"No Stripe price ID configured for plan '{plan.name}' "
             f"in country '{pricing.country}'"
         )
+    
+    stripe_customer_id = get_or_create_stripe_customer(user)
 
     try:
         session = stripe.checkout.Session.create(
             mode='subscription',
-            customer_email=user.email,
+            customer=stripe_customer_id,
+            # customer_email=user.email,
             line_items=[{
                 'price': pricing.stripe_price_id,
                 'quantity': 1,
@@ -453,21 +489,6 @@ def create_checkout_session(user, plan, pricing, subscription):
         raise
 
 def extract_stripe_payment_details(invoice_id, logger):
-    """
-    Given a Stripe Invoice ID, fetch the invoice and extract payment details.
-
-    In Stripe SDK v15 (API 2026-03-25.dahlia), Invoice.payment_intent and
-    Invoice.charge were REMOVED. Payment data now lives under:
-        invoice.payments.data[i].payment.payment_intent
-
-    Returns a dict with:
-      - stripe_invoice_id
-      - stripe_payment_intent_id
-      - payment_method  (type string, e.g. 'card')
-      - billing_country
-      - current_period_start  (datetime, UTC)
-      - current_period_end    (datetime, UTC)
-    """
     from datetime import datetime, timezone as dt_timezone
 
     result = {
@@ -564,7 +585,6 @@ def extract_stripe_payment_details(invoice_id, logger):
         f"invoice={result['stripe_invoice_id']}"
     )
     return result
-
 
 def process_initial_subscription(payment, plan, session):
     from datetime import datetime, timezone as dt_timezone
