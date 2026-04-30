@@ -1661,6 +1661,7 @@ class StripeWebhookView(APIView):
                 updates["country"] = details["billing_country"]
             if updates:
                 PaymentTransaction.objects.filter(id=payment.id).update(**updates)
+                payment.refresh_from_db()
                 logger.info(f"[renewal] Enriched payment {payment.id} with {list(updates.keys())}")
             else:
                 logger.warning(f"[renewal] Enrichment returned no data for payment {payment.id}")
