@@ -29,7 +29,8 @@ SECRET_KEY = 'django-insecure-ia35agc!--gj$1u%w0nfu@!x^i*98%+%g$ut9h_7%in6chwdtd
 DEBUG = False
 
 # ALLOWED_HOSTS = ["*"]
-ALLOWED_HOSTS = ["91.108.110.206", "api.rcubesmart.com", "www.api.rcubesmart.com"]
+# ALLOWED_HOSTS = ["91.108.110.206", "api.rcubesmart.com", "www.api.rcubesmart.com"]
+ALLOWED_HOSTS = ["13.220.121.85", "backend.rcubesmart.com", "www.backend.rcubesmart.com"]
 
 # CSRF_TRUSTED_ORIGINS = [
 #     "http://localhost:8080",
