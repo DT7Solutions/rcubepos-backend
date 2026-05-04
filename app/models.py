@@ -232,7 +232,7 @@ class Restaurant(models.Model):
 # ========================= # SUBSCRIPTION MODELS # =========================
 
 class SubscriptionPlan(models.Model):
-    INTERVAL_CHOICES = [('monthly', 'Monthly'), ('yearly', 'Yearly')]
+    INTERVAL_CHOICES = [('daily', 'Daily'), ('monthly', 'Monthly'), ('yearly', 'Yearly')]
 
     name = models.CharField(max_length=50)
     # price = models.DecimalField(max_digits=10, decimal_places=2)
@@ -241,7 +241,8 @@ class SubscriptionPlan(models.Model):
     popular = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
 
-    stripe_product_id = models.CharField(max_length=255, null=True, blank=True)
+    stripe_product_id_test = models.CharField(max_length=255, blank=True, null=True)
+    stripe_product_id_live = models.CharField(max_length=255, blank=True, null=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -249,14 +250,6 @@ class SubscriptionPlan(models.Model):
     history = HistoricalRecords()
 
     def clean(self):
-        """Validate plan constraints."""
-        # Price validation
-        if self.price and self.price < 0:
-            raise ValidationError({'price': 'Price cannot be negative.'})
-
-        if self.price and self.price > 999999.99:
-            raise ValidationError({'price': 'Price exceeds maximum limit.'})
-
         # Interval validation
         if self.interval not in dict(self.INTERVAL_CHOICES):
             raise ValidationError({'interval': "Invalid interval. Must be 'monthly' or 'yearly'."})
@@ -289,8 +282,10 @@ class PlanPricing(models.Model):
     currency = models.CharField(max_length=10)
     price = models.DecimalField(max_digits=10, decimal_places=2)
 
-    stripe_price_id = models.CharField(max_length=255, blank=True, null=True)
+    stripe_price_id_test = models.CharField(max_length=255, blank=True, null=True)
+    stripe_price_id_live = models.CharField(max_length=255, blank=True, null=True)
 
+    # Tracking if plan is active
     is_active = models.BooleanField(default=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -306,7 +301,7 @@ class PlanPricing(models.Model):
         return f"{self.plan.name} - {self.country} {self.currency} {self.price}"
     
     class Meta:
-        unique_together = ('plan', 'country')
+        unique_together = ('plan', 'country', 'currency')
 
 class Subscription(models.Model):
     STATUS_CHOICES = [

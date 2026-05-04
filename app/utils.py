@@ -322,6 +322,18 @@ def get_plan_pricing(plan, country):
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
+def get_stripe_price_id(pricing):
+    from django.conf import settings
+    
+    if settings.STRIPE_LIVE_MODE:
+        price_id = pricing.stripe_price_id_live
+    else:
+        price_id = pricing.stripe_price_id_test
+        
+    if not price_id:
+        raise ValueError("Stripe price ID is empty. Check if STRIPE_LIVE_MODE matches the pricing data.")
+    return price_id
+
 def get_or_create_stripe_customer(user):
     if user.stripe_customer_id:
         try:
@@ -388,6 +400,7 @@ def create_stripe_price(product_id, pricing):
     Creates a Stripe Price for a given product and pricing.
     """
     interval_map = {
+        "daily": "day",
         "monthly": "month",
         "yearly": "year"
     }
@@ -416,39 +429,36 @@ def create_stripe_price(product_id, pricing):
         raise Exception(f"Stripe price creation failed: {str(e)}")
 
 def ensure_stripe_product_and_price(pricing):
-    """
-    Ensures that a Stripe Product and Price exist for the given pricing.
-    Updates the plan and pricing models with the Stripe IDs.
-    """
+    from django.conf import settings
+
     plan = pricing.plan
-    
-    # 1. Ensure Product exists
-    if not plan.stripe_product_id:
+    is_live = settings.STRIPE_LIVE_MODE
+
+    # Select correct fields
+    product_field = "stripe_product_id_live" if is_live else "stripe_product_id_test"
+    price_field = "stripe_price_id_live" if is_live else "stripe_price_id_test"
+
+    product_id = getattr(plan, product_field)
+    price_id = getattr(pricing, price_field)
+
+    # Create product if missing
+    if not product_id:
         product = create_stripe_product(plan)
-        plan.stripe_product_id = product.id
-        plan.save(update_fields=["stripe_product_id"])
-    
-    # 2. Ensure Price exists or create new if price/currency changed
-    # Stripe prices are immutable, so we always create a new one if it's missing or needs update
-    if not pricing.stripe_price_id:
-        price = create_stripe_price(plan.stripe_product_id, pricing)
-        pricing.stripe_price_id = price.id
-        pricing.save(update_fields=["stripe_price_id"])
-    else:
-        # Optionally verify if the price on Stripe matches our local price
-        # For now, we assume if stripe_price_id exists and we are calling this 
-        # because of an update, we might want to force a new one.
-        pass
-    
-    return plan.stripe_product_id, pricing.stripe_price_id
+        setattr(plan, product_field, product.id)
+        plan.save(update_fields=[product_field])
+        product_id = product.id
+
+    # Create price if missing
+    if not price_id:
+        price = create_stripe_price(product_id, pricing)
+        setattr(pricing, price_field, price.id)
+        pricing.save(update_fields=[price_field])
+
+    return product_id, getattr(pricing, price_field)
 
 def create_checkout_session(user, plan, pricing, subscription):
-    if not pricing.stripe_price_id:
-        raise ValueError(
-            f"No Stripe price ID configured for plan '{plan.name}' "
-            f"in country '{pricing.country}'"
-        )
-    
+    product_id, price_id = ensure_stripe_product_and_price(pricing)
+
     stripe_customer_id = get_or_create_stripe_customer(user)
 
     try:
@@ -457,7 +467,7 @@ def create_checkout_session(user, plan, pricing, subscription):
             customer=stripe_customer_id,
             # customer_email=user.email,
             line_items=[{
-                'price': pricing.stripe_price_id,
+                'price': price_id,
                 'quantity': 1,
             }],
             metadata={
@@ -629,6 +639,10 @@ def process_initial_subscription(payment, plan, session):
     # ── Extract all payment details from the Invoice ───────────────────────
     details = extract_stripe_payment_details(invoice_id, logger)
 
+    if not details.get("stripe_invoice_id") or not details.get("current_period_end"):
+        logger.error(f"[initial] Critical missing details from invoice {invoice_id}. Details: {details}")
+        raise Exception("Failed to extract essential payment details from Stripe.")
+
     # Apply extracted details to the payment record
     payment.stripe_invoice_id = details["stripe_invoice_id"]
     payment.stripe_payment_intent_id = details["stripe_payment_intent_id"]
@@ -653,9 +667,11 @@ def process_initial_subscription(payment, plan, session):
     sub.current_period_end = current_period_end
 
     if plan.interval == "monthly":
-        sub.end_date = sub.start_date + timedelta(days=30)
+        days = getattr(settings, 'SUBSCRIPTION_MONTHLY_DAYS', 30)
+        sub.end_date = sub.start_date + timedelta(days=days)
     elif plan.interval == "yearly":
-        sub.end_date = sub.start_date + timedelta(days=365)
+        days = getattr(settings, 'SUBSCRIPTION_YEARLY_DAYS', 365)
+        sub.end_date = sub.start_date + timedelta(days=days)
 
     sub.last_payment = payment
     sub.save()

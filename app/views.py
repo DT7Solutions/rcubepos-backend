@@ -23,8 +23,8 @@ from django.views.decorators.csrf import csrf_exempt
 
 from django.utils.timezone import now
 from django.utils.dateparse import parse_date
-from django.db import transaction
-from django.db.models import Sum, Count
+from django.db import transaction, IntegrityError
+from django.db.models import Sum, Count, Q
 from django.db.models.functions import TruncMonth
 from datetime import timedelta, timezone
 # from collections import deafultdict
@@ -1291,118 +1291,56 @@ class UpgradeSubscriptionView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        """
-        Upgrade or downgrade the user's active subscription to a new plan.
-        Stripe handles proration automatically.
-        
-        Body: { "plan_id": 3 }
-        """
         user = request.user
         plan_id = request.data.get("plan_id")
 
         if not plan_id:
-            return Response(
-                {"error": "plan_id is required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"error": "plan_id required"}, status=400)
+
+        try:
+            plan = SubscriptionPlan.objects.get(id=int(plan_id), is_active=True)
+        except (SubscriptionPlan.DoesNotExist, ValueError):
+            return Response({"error": "Invalid plan"}, status=400)
 
         sub = Subscription.objects.filter(
             user=user,
-            status="active"
-        ).select_related("plan").first()
+            status='active'
+        ).first()
 
         if not sub:
-            return Response(
-                {"error": "No active subscription found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "No active subscription"}, status=400)
 
-        if not sub.stripe_subscription_id:
-            return Response(
-                {"error": "Subscription has no Stripe reference — contact support"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Validate new plan
-        try:
-            new_plan = SubscriptionPlan.objects.get(id=int(plan_id), is_active=True)
-        except (SubscriptionPlan.DoesNotExist, ValueError):
-            return Response(
-                {"error": "Invalid or inactive plan"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if sub.plan and sub.plan.id == new_plan.id:
-            return Response(
-                {"error": "You are already on this plan"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Get correct pricing for user's country
         country = user.billing_country or "US"
-        pricing = get_plan_pricing(new_plan, country)
+        pricing = get_plan_pricing(plan, country)
 
-        if not pricing or not pricing.stripe_price_id:
-            return Response(
-                {"error": f"No pricing available for plan in country '{country}'"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if not pricing:
+            return Response({"error": "Pricing not available"}, status=400)
+
+        # 🔥 Ensure Stripe price exists
+        _, price_id = ensure_stripe_product_and_price(pricing)
 
         try:
-            # Fetch current subscription to get the subscription item ID
             stripe_sub = stripe.Subscription.retrieve(sub.stripe_subscription_id)
-            
-            if not stripe_sub.items.data:
-                return Response(
-                    {"error": "Could not find subscription items on Stripe"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
 
-            subscription_item_id = stripe_sub.items.data[0].id
+            if not stripe_sub.get("items") or not stripe_sub["items"].get("data"):
+                return Response({"error": "Current subscription has no items to upgrade"}, status=400)
 
-            # Modify the subscription with the new price
-            # proration_behavior='create_prorations' charges/credits the difference immediately
             stripe.Subscription.modify(
                 sub.stripe_subscription_id,
                 items=[{
-                    "id": subscription_item_id,
-                    "price": pricing.stripe_price_id,
+                    "id": stripe_sub["items"]["data"][0].id,
+                    "price": price_id,
                 }],
                 proration_behavior="create_prorations",
             )
 
-            # Update local plan immediately — webhook will also confirm via
-            # handle_subscription_updated but we update optimistically here
-            old_plan_name = sub.plan.name if sub.plan else "none"
-            sub.plan = new_plan
-            sub.cancel_at_period_end = False  # upgrading removes any pending cancellation
-            sub.cancel_at = None
-            sub.save(update_fields=["plan", "cancel_at_period_end", "cancel_at"])
-
-            logger.info(
-                f"Subscription {sub.id} upgraded: {old_plan_name} → {new_plan.name} "
-                f"for user {user.id}"
-            )
-
-            return Response(
-                {
-                    "message": f"Successfully upgraded to {new_plan.name}",
-                    "plan": new_plan.name,
-                    "interval": new_plan.interval,
-                    "country": pricing.country,
-                    "currency": pricing.currency,
-                },
-                status=status.HTTP_200_OK
-            )
+            return Response({
+                "message": "Subscription updated successfully"
+            })
 
         except stripe.error.StripeError as e:
-            logger.error(
-                f"Stripe error upgrading subscription {sub.stripe_subscription_id}: {str(e)}"
-            )
-            return Response(
-                {"error": "Failed to upgrade subscription. Please try again."},
-                status=status.HTTP_502_BAD_GATEWAY
-            )
+            logger.error(f"Upgrade failed: {str(e)}", exc_info=True)
+            return Response({"error": str(e)}, status=502)
 
 class SubscriptionPlanViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.AllowAny]
@@ -1540,7 +1478,10 @@ class PlanPricingViewSet(viewsets.ModelViewSet):
                     logger.info(f"Price/currency changed for pricing {updated_instance.id}, creating new Stripe price")
                     
                     # Force creation of a new price by clearing the old ID
-                    updated_instance.stripe_price_id = None
+                    if settings.STRIPE_LIVE_MODE:
+                        updated_instance.stripe_price_id_live = None
+                    else:
+                        updated_instance.stripe_price_id_test = None
                     ensure_stripe_product_and_price(updated_instance)
                 else:
                     # Just ensure everything is in sync
@@ -1586,9 +1527,15 @@ class CreateCheckoutSessionView(APIView):
                 .order_by('-created_at')
             )
 
-            if existing_subs.filter(status='active').exists():
+            active_sub = existing_subs.filter(status='active').first()
+
+            if active_sub:
                 return Response(
-                    {"error": "You already have an active subscription"},
+                    {
+                        "error": "You already have an active subscription",
+                        "action": "upgrade_required",
+                        "subscription_id": active_sub.id,
+                    },
                     status=400
                 )
 
@@ -1623,7 +1570,7 @@ class CreateCheckoutSessionView(APIView):
             return Response({"error": str(e)}, status=400)
         except stripe.error.StripeError as e:
             return Response(
-                {"error": "Payment provider error. Please try again later."},
+                {"error": str(e)},
                 status=502
             )
         except Exception as e:
@@ -1678,8 +1625,20 @@ class StripeWebhookView(APIView):
         event_type = event.type
 
         # ── Idempotency: skip already-processed events ─────────────────────
-        existing_log = StripeWebhookLog.objects.filter(event_id=event_id).first()
-        if existing_log and existing_log.processed:
+        try:
+            with transaction.atomic():
+                existing_log, created = StripeWebhookLog.objects.get_or_create(
+                    event_id=event_id,
+                    defaults={
+                        'event_type': event_type,
+                        'payload': {"id": event.id, "type": event.type, "created": event.created},
+                        'processed': False,
+                    }
+                )
+        except IntegrityError:
+            return JsonResponse({"status": "already processing"}, status=200)
+
+        if not created and existing_log.processed:
             return JsonResponse({"status": "already processed"}, status=200)
 
         data = event.data.object
@@ -1695,38 +1654,29 @@ class StripeWebhookView(APIView):
                 self.handle_subscription_deleted(data)
             elif event_type == "customer.subscription.updated":
                 self.handle_subscription_updated(data)
+            elif event_type in [
+                "invoice.payment_action_required",
+                "payment_intent.succeeded",
+                "payment_intent.payment_failed",
+                "customer.subscription.trial_will_end",
+                "charge.dispute.created"
+            ]:
+                logger.info(f"Webhook event received and acknowledged: {event_type}")
             else:
                 logger.debug(f"Unhandled webhook event type: {event_type}")
 
             # Log success
-            if existing_log:
-                existing_log.processed = True
-                existing_log.processing_error = None
-                existing_log.save()
-            else:
-                StripeWebhookLog.objects.create(
-                    event_id=event_id,
-                    event_type=event_type,
-                    payload={"id": event.id, "type": event.type, "created": event.created},
-                    processed=True,
-                )
+            existing_log.processed = True
+            existing_log.processing_error = None
+            existing_log.save(update_fields=["processed", "processing_error"])
 
         except Exception as e:
             logger.error(
                 f"Failed to process webhook {event_id} ({event_type}): {str(e)}",
                 exc_info=True
             )
-            if existing_log:
-                existing_log.processing_error = str(e)
-                existing_log.save()
-            else:
-                StripeWebhookLog.objects.create(
-                    event_id=event_id,
-                    event_type=event_type,
-                    payload={"id": event.id, "type": event.type, "created": event.created},
-                    processed=False,
-                    processing_error=str(e),
-                )
+            existing_log.processing_error = str(e)
+            existing_log.save(update_fields=["processing_error"])
             return JsonResponse({"error": "Webhook processing failed"}, status=500)
 
         return JsonResponse({"status": "success"})
@@ -1834,28 +1784,16 @@ class StripeWebhookView(APIView):
 
         logger.info(f"[renewal] Found local subscription id={sub.id} user={sub.user_id} status={sub.status}")
 
+        if getattr(sub, 'plan', None) is None:
+            logger.error(f"[renewal] Subscription {sub.id} has no plan associated with it — failing renewal to prevent invoice errors")
+            return
+
         stripe_invoice_id = getattr(invoice, "id", None)
         if not stripe_invoice_id:
             logger.warning("[renewal] Invoice has no id — skipping")
             return
 
         logger.info(f"[renewal] stripe_invoice_id={stripe_invoice_id}")
-
-        if PaymentTransaction.objects.filter(stripe_invoice_id=stripe_invoice_id).exists():
-            logger.info(f"[renewal] Invoice {stripe_invoice_id} already processed — skipping")
-            try:
-                lines = getattr(invoice, "lines", None)
-                if lines and lines.data:
-                    period = getattr(lines.data[0], "period", None)
-                    if period:
-                        sub.current_period_start = datetime.fromtimestamp(period.start, tz=dt_timezone.utc)
-                        sub.current_period_end = datetime.fromtimestamp(period.end, tz=dt_timezone.utc)
-                        sub.status = "active"
-                        sub.save(update_fields=["current_period_start", "current_period_end", "status"])
-                        logger.info(f"[renewal] Period dates synced for existing invoice")
-            except Exception as e:
-                logger.warning(f"[renewal] Period sync failed: {str(e)}")
-            return
 
         amount_paid_raw = getattr(invoice, "amount_paid", 0) or 0
         currency = (getattr(invoice, "currency", "usd") or "usd").upper()
@@ -1881,12 +1819,24 @@ class StripeWebhookView(APIView):
             logger.warning(f"[renewal] Period extraction failed: {str(e)}")
 
         with transaction.atomic():
+            locked_sub = Subscription.objects.select_for_update().get(id=sub.id)
+            
+            if PaymentTransaction.objects.filter(stripe_invoice_id=stripe_invoice_id).exists():
+                logger.info(f"[renewal] Invoice {stripe_invoice_id} already processed — skipping")
+                if current_period_start and current_period_end:
+                    locked_sub.current_period_start = current_period_start
+                    locked_sub.current_period_end = current_period_end
+                    locked_sub.status = "active"
+                    locked_sub.save(update_fields=["current_period_start", "current_period_end", "status"])
+                    logger.info(f"[renewal] Period dates synced for existing invoice")
+                return
+
             payment = PaymentTransaction.objects.create(
-                user=sub.user,
-                subscription=sub,
+                user=locked_sub.user,
+                subscription=locked_sub,
                 base_amount=base_amount,
                 currency=currency,
-                country=getattr(sub.user, "billing_country", None) or "",
+                country=getattr(locked_sub.user, "billing_country", None) or "",
                 stripe_invoice_id=stripe_invoice_id,
                 status="success",
                 paid_at=now(),
@@ -1894,20 +1844,20 @@ class StripeWebhookView(APIView):
 
             logger.info(f"[renewal] Created PaymentTransaction id={payment.id}")
 
-            sub.status = "active"
-            sub.last_payment = payment
+            locked_sub.status = "active"
+            locked_sub.last_payment = payment
             if current_period_start:
-                sub.current_period_start = current_period_start
+                locked_sub.current_period_start = current_period_start
             if current_period_end:
-                sub.current_period_end = current_period_end
-            sub.save(update_fields=[
+                locked_sub.current_period_end = current_period_end
+            locked_sub.save(update_fields=[
                 "status",
                 "last_payment",
                 "current_period_start",
                 "current_period_end",
             ])
 
-            logger.info(f"[renewal] Subscription {sub.id} updated — status=active last_payment={payment.id}")
+            logger.info(f"[renewal] Subscription {locked_sub.id} updated — status=active last_payment={payment.id}")
 
         try:
             logger.info(f"[renewal] Starting enrichment for invoice {stripe_invoice_id}")
@@ -2030,12 +1980,12 @@ class StripeWebhookView(APIView):
             if items and items.data:
                 stripe_price_id = items.data[0].price.id
                 pricing = PlanPricing.objects.select_related("plan").filter(
-                    stripe_price_id=stripe_price_id
+                    Q(stripe_price_id_test=stripe_price_id) | Q(stripe_price_id_live=stripe_price_id)
                 ).first()
-                if pricing and pricing.plan != sub.plan:
+                if pricing and pricing.plan != getattr(sub, 'plan', None):
                     logger.info(
                         f"Plan changed for subscription {stripe_sub_id}: "
-                        f"{sub.plan} → {pricing.plan}"
+                        f"{getattr(sub, 'plan', None)} → {pricing.plan}"
                     )
                     sub.plan = pricing.plan
                     update_fields.append("plan")

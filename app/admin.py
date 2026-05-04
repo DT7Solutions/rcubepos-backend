@@ -166,7 +166,7 @@ class StripeWebhookLogAdmin(admin.ModelAdmin):
 @admin.register(PlanPricing)
 class PlanPricingAdmin(admin.ModelAdmin):
     list_display = (
-        'id', 'plan', 'country', 'currency', 'price', 'stripe_price_id', 'is_active'
+        'id', 'plan', 'country', 'currency', 'price', 'stripe_price_id_test', 'stripe_price_id_live', 'is_active'
     )
-    search_fields = ('plan__name', 'country', 'stripe_price_id')
+    search_fields = ('plan__name', 'country', 'stripe_price_id_test', 'stripe_price_id_live')
     list_filter = ('country', 'currency', 'is_active')

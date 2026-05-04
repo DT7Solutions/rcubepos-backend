@@ -346,7 +346,11 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
 
     # ============== PRICING HELPER METHODS ==============
     def _get_pricing(self, obj):
-        return self.context.get("pricing_map", {}).get(obj.id)
+        pricing = self.context.get("pricing_map", {}).get(obj.id)
+
+        if pricing:
+            return pricing
+        return obj.pricings.filter(is_active=True).order_by('price').first()
     
     def get_price(self, obj):
         pricing = self._get_pricing(obj)
@@ -363,8 +367,8 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
 
     # =============== Validations ===============
     def validate_interval(self, value):
-        if value not in ['monthly', 'yearly']:
-            raise serializers.ValidationError("Invalid interval. Must be 'monthly' or 'yearly'.")
+        if value not in ['daily', 'monthly', 'yearly']:
+            raise serializers.ValidationError("Invalid interval. Must be 'daily', 'monthly', or 'yearly'.")
         return value
 
     def validate_features(self, value):
@@ -410,12 +414,11 @@ class PlanPricingSerializer(serializers.ModelSerializer):
             'country',
             'currency',
             'price',
-            'stripe_price_id',
             'is_active',
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'stripe_price_id_test', 'stripe_price_id_live']
 
     def validate_country(self, value):
         if len(value) != 2:
