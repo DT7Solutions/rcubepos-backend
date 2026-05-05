@@ -468,7 +468,8 @@ class PaymentTransaction(models.Model):
         if not self.transaction_id:
             self.transaction_id = self.generate_transaction_id()
 
-        self.calculate_final_amount()
+        if not self.pk:
+            self.calculate_final_amount()
 
         super().save(*args, **kwargs)
 

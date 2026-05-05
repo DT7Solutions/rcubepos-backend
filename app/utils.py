@@ -354,10 +354,10 @@ def get_or_create_stripe_customer(user):
     )
 
     # Only attach test clock in non-production environments, and only if configured
-    # test_clock_id = getattr(settings, 'STRIPE_TEST_CLOCK_ID', None)
-    # if test_clock_id:
-    #     create_kwargs["test_clock"] = test_clock_id
-    #     logger.info(f"[customer] Attaching test clock {test_clock_id}")
+    test_clock_id = getattr(settings, 'STRIPE_TEST_CLOCK_ID', None)
+    if test_clock_id:
+        create_kwargs["test_clock"] = test_clock_id
+        logger.info(f"[customer] Attaching test clock {test_clock_id}")
 
     customer = stripe.Customer.create(**create_kwargs)
 
