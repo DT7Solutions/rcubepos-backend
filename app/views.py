@@ -1609,7 +1609,13 @@ class CreateCheckoutSessionView(APIView):
             # Take the most recent non-active one, or create fresh
             sub = existing_subs.first()
             if not sub:
-                sub = Subscription.objects.create(user=user, status='none')
+                restaurant = Restaurant.objects.filter(owner=user, is_deleted=False).first()
+                sub = Subscription.objects.create(user=user, status='none', restaurant=restaurant)
+            elif not sub.restaurant:
+                restaurant = Restaurant.objects.filter(owner=user, is_deleted=False).first()
+                if restaurant:
+                    sub.restaurant = restaurant
+                    sub.save(update_fields=['restaurant'])
 
         # ── Pricing ───────────────────────────────────────────────────────
         country = (

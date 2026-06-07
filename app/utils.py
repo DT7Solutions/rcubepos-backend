@@ -659,6 +659,13 @@ def process_initial_subscription(payment, plan, session):
     payment.save()
 
     # ── Activate subscription ─────────────────────────────────────────────
+    # Link restaurant if not already linked
+    if not sub.restaurant:
+        restaurant = Restaurant.objects.filter(owner=sub.user, is_deleted=False).first()
+        if restaurant:
+            sub.restaurant = restaurant
+            logger.info(f"Linked restaurant {restaurant.id} to subscription {sub.id} during activation")
+
     sub.plan = plan
     sub.status = "active"
     sub.stripe_subscription_id = stripe_subscription_id

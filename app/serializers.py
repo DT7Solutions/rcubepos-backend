@@ -222,6 +222,7 @@ class RestaurantSerializer(serializers.ModelSerializer):
     owner_email = serializers.CharField(source='owner.email', read_only=True)
 
     plan = serializers.SerializerMethodField()
+    plan_id = serializers.SerializerMethodField()
     expiry_date = serializers.SerializerMethodField()
     latest_invoice_id = serializers.SerializerMethodField()
 
@@ -236,6 +237,7 @@ class RestaurantSerializer(serializers.ModelSerializer):
             'address',
             'gst_number',
             'plan',
+            'plan_id',
             'status',
             'created_at',
             'expiry_date',
@@ -243,18 +245,48 @@ class RestaurantSerializer(serializers.ModelSerializer):
         ]
 
     def get_plan(self, obj):
-        if hasattr(obj, 'subscription') and obj.subscription.plan:
+        if hasattr(obj, 'subscription') and obj.subscription and obj.subscription.plan:
             return obj.subscription.plan.name
+        
+        # Fallback: check if the owner has a subscription
+        sub = Subscription.objects.filter(user=obj.owner).select_related('plan').first()
+        if sub and sub.plan:
+            # Auto-repair the linkage if not already set to another restaurant
+            if not sub.restaurant:
+                sub.restaurant = obj
+                sub.save(update_fields=['restaurant'])
+            return sub.plan.name
         return "Free"
 
+    def get_plan_id(self, obj):
+        if hasattr(obj, 'subscription') and obj.subscription and obj.subscription.plan:
+            return obj.subscription.plan.id
+        
+        # Fallback: check if the owner has a subscription
+        sub = Subscription.objects.filter(user=obj.owner).select_related('plan').first()
+        if sub and sub.plan:
+            return sub.plan.id
+        return None
+
     def get_expiry_date(self, obj):
-        if hasattr(obj, 'subscription') and obj.subscription.end_date:
+        if hasattr(obj, 'subscription') and obj.subscription and obj.subscription.end_date:
             return obj.subscription.end_date
+        
+        # Fallback
+        sub = Subscription.objects.filter(user=obj.owner).first()
+        if sub:
+            return sub.end_date
         return None
         
     def get_latest_invoice_id(self, obj):
         if hasattr(obj, 'subscription') and obj.subscription:
             latest_invoice = obj.subscription.invoices.order_by('-created_at').first()
+            return latest_invoice.id if latest_invoice else None
+            
+        # Fallback
+        sub = Subscription.objects.filter(user=obj.owner).first()
+        if sub:
+            latest_invoice = sub.invoices.order_by('-created_at').first()
             return latest_invoice.id if latest_invoice else None
         return None
     
