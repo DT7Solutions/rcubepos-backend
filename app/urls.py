@@ -53,4 +53,9 @@ urlpatterns = [
 
     # SETTINGS
     path('settings/', PlatformSettingsView.as_view()),
+
+    # APP DOWNLOADS
+    path('download/windows/', DownloadAppReleaseView.as_view(), name='download_windows_app'),
+    path('download/pos-app/', DownloadAppReleaseView.as_view(), name='download_pos_app'),
+    path('download/info/', PlatformReleaseInfoView.as_view(), name='download_platform_info'),
 ]

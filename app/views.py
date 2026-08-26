@@ -12,7 +12,7 @@ from rest_framework import status
 from django.contrib.auth import authenticate, get_user_model
 from django.conf import settings
 from django.core.signing import dumps, loads, SignatureExpired, BadSignature
-from django.http import HttpResponse
+from django.http import HttpResponse, FileResponse, Http404
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
@@ -28,6 +28,7 @@ from django.db.models import Sum, Count, Q
 from django.db.models.functions import TruncMonth
 from datetime import timedelta, timezone
 # from collections import deafultdict
+import os
 import logging
 import stripe
 import requests
@@ -2397,8 +2398,126 @@ class PlatformSettingsView(APIView):
         settings = PlatformSettings.objects.first()
         serializer = PlatformSettingsSerializer(settings)
         return Response(serializer.data)
-    
 
 
+# ========================= # APP DOWNLOAD VIEWS # =========================
+class DownloadAppReleaseView(APIView):
+    """
+    Public endpoint to stream the desktop application installer (.exe for Windows).
+    Supports query param ?platform=windows (default: windows).
+    """
+    permission_classes = [permissions.AllowAny]
 
-    
+    def get(self, request):
+        platform_param = request.query_params.get("platform", "windows").lower()
+        target_filename = "RcubeSmartPOS_v1.0.0_Setup.exe"
+
+        releases_dir = os.path.join(settings.MEDIA_ROOT, "releases")
+        file_path = os.path.join(releases_dir, target_filename)
+
+        # Fallback: if the exact filename is not found, check for any .exe in media/releases/
+        if not os.path.exists(file_path) and os.path.exists(releases_dir):
+            exe_files = [f for f in os.listdir(releases_dir) if f.lower().endswith(".exe")]
+            if exe_files:
+                file_path = os.path.join(releases_dir, exe_files[0])
+
+        if not os.path.exists(file_path):
+            return Response(
+                {
+                    "success": False,
+                    "error": "Installer file not found on server.",
+                    "details": f"Please upload '{target_filename}' into backend 'media/releases/' folder.",
+                    "platform": platform_param,
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            file_handle = open(file_path, "rb")
+            response = FileResponse(
+                file_handle,
+                as_attachment=True,
+                filename="RcubeSmartPOS_v1.0.0_Setup.exe",
+                content_type="application/vnd.microsoft.portable-executable",
+            )
+            file_size = os.path.getsize(file_path)
+            response["Content-Length"] = file_size
+            response["Access-Control-Expose-Headers"] = "Content-Disposition, Content-Length"
+            return response
+        except Exception as e:
+            logger.error(f"Error serving app download: {str(e)}", exc_info=True)
+            return Response(
+                {"success": False, "error": "Failed to stream download file", "details": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class PlatformReleaseInfoView(APIView):
+    """
+    Public endpoint providing release metadata, download availability, and store URLs.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        releases_dir = os.path.join(settings.MEDIA_ROOT, "releases")
+        target_filename = "RcubeSmartPOS_v1.0.0_Setup.exe"
+        file_path = os.path.join(releases_dir, target_filename)
+
+        # Also check fallback .exe
+        windows_file_exists = os.path.exists(file_path)
+        windows_file_size_mb = 65.4
+        if not windows_file_exists and os.path.exists(releases_dir):
+            exe_files = [f for f in os.listdir(releases_dir) if f.lower().endswith(".exe")]
+            if exe_files:
+                windows_file_exists = True
+                file_path = os.path.join(releases_dir, exe_files[0])
+
+        if windows_file_exists and os.path.exists(file_path):
+            try:
+                windows_file_size_mb = round(os.path.getsize(file_path) / (1024 * 1024), 2)
+            except Exception:
+                pass
+
+        data = {
+            "version": "1.0.0",
+            "release_date": "2026-08-26",
+            "platforms": {
+                "windows": {
+                    "name": "Windows Desktop",
+                    "version": "v1.0.0",
+                    "filename": target_filename,
+                    "available": windows_file_exists,
+                    "size_mb": windows_file_size_mb,
+                    "supported_os": "Windows 10 / 11 (64-bit)",
+                    "download_url": "/api/download/windows/",
+                },
+                "android": {
+                    "name": "Android / POS Terminal",
+                    "version": "v1.0.0",
+                    "status": "active",
+                    "store_url": "https://play.google.com/store/apps",
+                    "badge_text": "Get it on Google Play",
+                },
+                "ios": {
+                    "name": "iOS / iPadOS",
+                    "version": "v1.0.0",
+                    "status": "coming_soon",
+                    "store_url": "https://apps.apple.com",
+                    "badge_text": "Download on App Store",
+                },
+                "macos": {
+                    "name": "macOS",
+                    "version": "v1.0.0",
+                    "status": "coming_soon",
+                    "store_url": "https://apps.apple.com",
+                    "badge_text": "Mac App Store",
+                },
+                "linux": {
+                    "name": "Linux Touch Terminals",
+                    "version": "v1.0.0",
+                    "status": "coming_soon",
+                    "badge_text": "Debian / AppImage",
+                },
+            },
+        }
+        return Response(data, status=status.HTTP_200_OK)
